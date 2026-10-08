@@ -1,0 +1,27 @@
+name = "cartes"
+main = "src/worker.js"
+compatibility_date = "2026-09-01"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+# L'API (/api/*) passe par le Worker ; tout le reste est servi tel quel depuis /public.
+
+# Base D1 existante de la collection (table `store` de l'ancienne version conservée telle quelle).
+[[d1_databases]]
+binding = "DB"
+database_name = "ma-collection-db"
+database_id = "350a8a69-e922-4d9e-b88d-0876d64daada"
+
+# Connexion : vérification de la session auprès du service de comptes central
+# (liaison interne Worker -> Worker, sans repasser par Internet).
+[[services]]
+binding = "COMPTE"
+service = "kayto-compte"
+
+# Reconnaissance d'image (Gemini), prix (JustTCG) et recherche d'image (Google) :
+# on réutilise l'ancien Worker `serveur-carte`, qui garde ses clés secrètes.
+# Liaison interne uniquement : seules les personnes connectées à Cartes peuvent l'utiliser.
+[[services]]
+binding = "OUTILS"
+service = "serveur-carte"

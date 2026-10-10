@@ -307,6 +307,9 @@
 .binder-note{background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:10px 14px; font-size:13px; color:var(--ink-dim); margin-bottom:14px;}
 .coll-binder{margin-top:12px; width:100%; padding:7px 10px; border:1px solid var(--line); background:var(--panel-2); border-radius:8px; font-size:12.5px; font-weight:600; cursor:pointer; color:var(--ink);}
 .coll-binder:hover{border-color:var(--accent); color:var(--accent);}
+.binder-src{font-size:12px; color:var(--ink-dim); margin:-6px 0 12px;}
+.binder-tile.missing .noimg{opacity:.4;}
+.binder-tile:not(.missing) .noimg{background:var(--accent-soft); color:var(--ink); font-weight:600;}
 
 </style>
 </head>
@@ -1370,8 +1373,7 @@ if(autoState.review.length > 60 || f.review.length > 60){ const m = document.cre
 }
 
 /* ================= CLASSEUR ================= */
-const binderState = { category: '', setId: '', filter: 'all', sets: null, cards: null, error: '', loading: false, token: 0 };
-const BINDER_API = 'https://api.pokemontcg.io/v2/';
+const binderState = { category: '', setId: '', filter: 'all', token: 0, mem: {} };
 function binderLsGet(k, ttl){
 try{ const o = JSON.parse(localStorage.getItem(k) || 'null'); if(o && Date.now() - o.t < ttl) return o.d; }catch(e){}
 return null;
@@ -1379,67 +1381,37 @@ return null;
 function binderLsSet(k, d){
 try{ localStorage.setItem(k, JSON.stringify({t: Date.now(), d})); return true; }catch(e){ return false; }
 }
-function binderPref(cat, val){
+function binderPrefStore(key, cat, val){
 try{
-const all = JSON.parse(localStorage.getItem('binder-pref-v1') || '{}');
+const all = JSON.parse(localStorage.getItem(key) || '{}');
 if(val === undefined) return all[cat] || '';
-all[cat] = val; localStorage.setItem('binder-pref-v1', JSON.stringify(all));
+if(val === '') delete all[cat]; else all[cat] = val;
+localStorage.setItem(key, JSON.stringify(all));
 }catch(e){}
 return '';
 }
-async function binderFetch(url){
+const binderPref = (cat, val)=>binderPrefStore('binder-pref-v1', cat, val);
+const binderGamePref = (cat, val)=>binderPrefStore('binder-game-v1', cat, val);
+(function(){ // ménage des anciens caches (version précédente du classeur)
+try{
+Object.keys(localStorage).forEach(k=>{ if(k.startsWith('binder-cards-v1:') || k === 'binder-sets-v1' || k === 'binder-cards-index') localStorage.removeItem(k); });
+}catch(e){}
+})();
+async function binderFetch(url, ms){
 let lastErr;
 for(let i=0;i<3;i++){
 const ctl = new AbortController();
-const to = setTimeout(()=>ctl.abort(), 60000);
+const to = setTimeout(()=>ctl.abort(), ms || 45000);
 try{
 const r = await fetch(url, {signal: ctl.signal});
 clearTimeout(to);
 if(r.ok) return await r.json();
 lastErr = new Error('HTTP ' + r.status);
+if(r.status === 404) break;
 }catch(e){ clearTimeout(to); lastErr = e; }
 await new Promise(res=>setTimeout(res, 700*(i+1)));
 }
 throw lastErr;
-}
-async function binderFetchAll(path, extra){
-const size = 100;
-const first = await binderFetch(`${BINDER_API}${path}?${extra}&pageSize=${size}&page=1`);
-const total = first.totalCount || (first.data || []).length;
-let out = (first.data || []).slice();
-const pages = Math.min(Math.ceil(total / size), 15);
-if(pages > 1){
-const rest = await Promise.all(Array.from({length: pages - 1}, (_, i)=>binderFetch(`${BINDER_API}${path}?${extra}&pageSize=${size}&page=${i + 2}`)));
-rest.forEach(j=>{ out = out.concat(j.data || []); });
-}
-return out;
-}
-async function binderLoadSets(){
-if(binderState.sets) return binderState.sets;
-let d = binderLsGet('binder-sets-v1', 7*86400000);
-if(!d){
-d = await binderFetchAll('sets', 'orderBy=-releaseDate&select=id,name,series,printedTotal,total,releaseDate,images');
-binderLsSet('binder-sets-v1', d);
-}
-binderState.sets = d;
-return d;
-}
-async function binderLoadCards(setId){
-const key = 'binder-cards-v1:' + setId;
-let d = binderLsGet(key, 30*86400000);
-if(!d){
-d = await binderFetchAll('cards', `q=set.id:${encodeURIComponent(setId)}&select=id,name,number,rarity,images`);
-d = d.map(c=>({id:c.id, name:c.name, number:c.number, rarity:c.rarity||'', img:(c.images&&c.images.small)||''}));
-if(binderLsSet(key, d)){
-try{
-const idx = JSON.parse(localStorage.getItem('binder-cards-index') || '[]').filter(x=>x!==setId);
-idx.push(setId);
-while(idx.length > 12){ localStorage.removeItem('binder-cards-v1:' + idx.shift()); }
-localStorage.setItem('binder-cards-index', JSON.stringify(idx));
-}catch(e){}
-}
-}
-return d;
 }
 const bNorm = s => String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
 function bNum(n){
@@ -1447,23 +1419,207 @@ const s = String(n||'').split('/')[0].trim().toUpperCase();
 const m = s.match(/^([A-Z]*)0*(\d+)([A-Z]*)$/);
 return m ? m[1] + m[2] + m[3] : s;
 }
+function bKey(n){ // numéro « utile » : dernier groupe de chiffres (OP01-077 -> 77, LOB-EN001 -> 1, 229/298 -> 229)
+const part = String(n||'').split('/')[0].trim().toUpperCase().split('-').pop();
+const s = part.replace(/[^A-Z0-9]/g,'');
+const m = s.match(/(\d+)([A-Z]{0,2})$/);
+return m ? String(parseInt(m[1], 10)) + m[2] : s;
+}
 function bDenom(n){ const p = String(n||'').split('/'); return p.length > 1 ? parseInt(p[1], 10) || 0 : 0; }
 function bNatCmp(a, b){ return String(a).localeCompare(String(b), 'fr', {numeric:true}); }
 function isPokemonCat(cat){ return /pok[eé]mon/i.test(cat || ''); }
-function binderKnown(sets){ return new Set(sets.map(s=>bNorm(s.name))); }
-function binderCardInSet(c, set, known){
-if(bNorm(c.set) === bNorm(set.name)) return true;
-const pt = Number(set.printedTotal) || 0;
-return !!pt && !known.has(bNorm(c.set)) && bDenom(c.number) === pt;
+
+/* ---- bases de données par jeu ---- */
+const TCGDEX_FR = 'https://api.tcgdex.net/v2/fr/';
+const OPTCG = 'https://optcgapi.com/api/';
+const DBFW_RAW = 'https://raw.githubusercontent.com/apitcg/dragon-ball-fusion-tcg-data/main/cards/en/';
+const RIFT = 'https://api.riftcodex.com/';
+const MTG_TYPES = { core:'Bases', expansion:'Extensions', masters:'Masters', draft_innovation:'Draft spéciaux', commander:'Commander', starter:'Découverte', box:'Coffrets', duel_deck:'Decks de duel', from_the_vault:'From the Vault', premium_deck:'Premium decks', planechase:'Planechase', archenemy:'Archenemy', arsenal:'Arsenal', spellbook:'Spellbooks', funny:'Humoristiques', promo:'Promos', eternal:'Éternel', treasure_chest:'Trésors' };
+const BINDER_GAMES = {
+pokemon: { label:'Pokémon', re:/pok[eé]mon/i, key:bNum, denom:true, source:'TCGdex (français)',
+async sets(){
+const series = await binderFetch(TCGDEX_FR + 'series');
+const full = await Promise.all(series.map(s=>binderFetch(TCGDEX_FR + 'series/' + encodeURIComponent(s.id)).catch(()=>null)));
+const out = [];
+full.slice().reverse().forEach(s=>{ if(!s) return; (s.sets || []).slice().reverse().forEach(x=>out.push({ id:x.id, name:x.name, code:x.id, series:s.name, total:x.cardCount && x.cardCount.total, printedTotal:x.cardCount && x.cardCount.official, date:'', logo:x.logo ? x.logo + '.png' : '' })); });
+return out;
+},
+async cards(set){
+const d = await binderFetch(TCGDEX_FR + 'sets/' + encodeURIComponent(set.id));
+return (d.cards || []).map(c=>({ id:c.id, name:c.name || '', number:String(c.localId || ''), rarity:'', img:c.image ? c.image + '/low.webp' : '' }));
+} },
+onepiece: { label:'One Piece', re:/one\s*piece/i, key:bKey, prefix:true, source:'optcgapi.com',
+async sets(){
+const [a, d] = await Promise.all([binderFetch(OPTCG + 'allSets/'), binderFetch(OPTCG + 'allDecks/').catch(()=>[])]);
+const out = [];
+a.slice().reverse().forEach(s=>out.push({ id:'s:' + s.set_id, name:s.set_name, code:s.set_id, series:'Boosters', total:null, printedTotal:null, date:'', logo:'' }));
+d.forEach(s=>out.push({ id:'d:' + s.structure_deck_id, name:s.structure_deck_name, code:s.structure_deck_id, series:'Starter decks', total:null, printedTotal:null, date:'', logo:'' }));
+return out;
+},
+async cards(set){
+const list = await binderFetch(OPTCG + (set.id.startsWith('s:') ? 'sets/' : 'decks/') + encodeURIComponent(set.code) + '/');
+const by = new Map();
+list.forEach(c=>{
+const k = c.card_set_id; const base = c.card_image_id === c.card_set_id;
+if(!by.has(k) || (base && !by.get(k).base)) by.set(k, { base, c });
+});
+return [...by.values()].map(({c})=>({ id:c.card_set_id, name:c.card_name || '', number:c.card_set_id, rarity:c.rarity || '', img:c.card_image || ('https://optcgapi.com/media/static/Card_Images/' + c.card_image_id + '.jpg') }));
+} },
+dragonball: { label:'Dragon Ball Fusion World', re:/dragon\s*ball|\bdbs?\b|\bdbz\b/i, key:bKey, prefix:true, source:'apitcg (GitHub)',
+async sets(){
+let ids;
+try{
+const list = await binderFetch('https://api.github.com/repos/apitcg/dragon-ball-fusion-tcg-data/contents/cards/en', 15000);
+ids = list.map(x=>String(x.name).replace(/\.json$/, '')).filter(Boolean);
+}catch(e){ ids = ['fb01','fb02','fb03','fb04','fb05','fb06','fs01','fs02','fs03','fs04','fs05','fs06','fs07','fs08','fs09','fs10','sb01','promotion']; }
+const kind = id=>/^fb/.test(id) ? ['Boosters', 'Booster ' + id.toUpperCase()] : /^fs/.test(id) ? ['Starter decks', 'Starter ' + id.toUpperCase()] : /^sb/.test(id) ? ['Boosters spéciaux', 'Booster spécial ' + id.toUpperCase()] : ['Promotions', 'Promotions'];
+const rank = id=>/^fb/.test(id) ? 0 : /^sb/.test(id) ? 1 : /^fs/.test(id) ? 2 : 3;
+return ids.slice().sort((a, b)=>rank(a) - rank(b) || bNatCmp(b, a)).map(id=>({ id, name:kind(id)[1], code:id, series:kind(id)[0], total:null, printedTotal:null, date:'', logo:'' }));
+},
+async cards(set){
+const list = await binderFetch(DBFW_RAW + encodeURIComponent(set.id) + '.json');
+const seen = new Set();
+return list.filter(c=>{ if(/-p\d+$/i.test(c.code) || seen.has(c.code)) return false; seen.add(c.code); return true; }).map(c=>({ id:c.id || c.code, name:c.name || '', number:c.code, rarity:c.rarity || '', img:(c.images && (c.images.small || c.images.large)) || '' }));
+} },
+magic: { label:'Magic', re:/magic|mtg/i, key:bKey, denom:true, source:'Scryfall',
+async sets(){
+const d = await binderFetch('https://api.scryfall.com/sets');
+return (d.data || []).filter(s=>!['token','memorabilia','minigame','vanguard','alchemy'].includes(s.set_type)).map(s=>({ id:s.code, name:s.name, code:s.code, series:MTG_TYPES[s.set_type] || 'Autres', total:s.card_count, printedTotal:s.printed_size || s.card_count, date:s.released_at || '', logo:s.icon_svg_uri || '' }));
+},
+async cards(set){
+let url = 'https://api.scryfall.com/cards/search?q=' + encodeURIComponent('e:' + set.code) + '&unique=prints&order=set';
+const out = [];
+for(let i=0;i<8 && url;i++){
+const d = await binderFetch(url);
+(d.data || []).forEach(c=>{
+const u = c.image_uris || (c.card_faces && c.card_faces[0] && c.card_faces[0].image_uris) || {};
+out.push({ id:c.id, name:c.printed_name || c.name || '', number:String(c.collector_number || ''), rarity:c.rarity || '', img:u.small || '' });
+});
+url = d.has_more ? d.next_page : '';
+if(url) await new Promise(r=>setTimeout(r, 120));
 }
-function binderOwnedFor(set, cards, known){
-return cards.filter(c=>binderCardInSet(c, set, known));
+return out;
+} },
+yugioh: { label:'Yu-Gi-Oh!', re:/yu-?\s*gi-?\s*oh|\bygo\b/i, key:bKey, prefix:true, source:'YGOPRODeck',
+async sets(){
+const d = await binderFetch('https://db.ygoprodeck.com/api/v7/cardsets.php');
+return d.slice().sort((a, b)=>String(b.tcg_date || '').localeCompare(String(a.tcg_date || ''))).map(s=>({ id:s.set_name, name:s.set_name, code:s.set_code, series:String(s.tcg_date || '').slice(0, 4) || 'Autres', total:s.num_of_cards || null, printedTotal:s.num_of_cards || null, date:s.tcg_date || '', logo:'' }));
+},
+async cards(set){
+const d = await binderFetch('https://db.ygoprodeck.com/api/v7/cardinfo.php?cardset=' + encodeURIComponent(set.name));
+const out = [];
+(d.data || []).forEach(c=>{
+const mine = (c.card_sets || []).filter(s=>s.set_name === set.name);
+if(!mine.length) return;
+const pick = mine.find(s=>/-EN\d+$/i.test(s.set_code)) || mine[0];
+out.push({ id:pick.set_code, name:c.name, number:pick.set_code, rarity:pick.set_rarity || '', img:(c.card_images && c.card_images[0] && c.card_images[0].image_url_small) || '' });
+});
+return out;
+} },
+lorcana: { label:'Lorcana', re:/lorcana/i, key:bKey, source:'Lorcast',
+async sets(){
+const d = await binderFetch('https://api.lorcast.com/v0/sets');
+return (d.results || []).slice().sort((a, b)=>String(b.released_at || '').localeCompare(String(a.released_at || ''))).map(s=>({ id:s.code, name:s.name, code:s.code, series:'Lorcana', total:null, printedTotal:null, date:String(s.released_at || '').slice(0, 10), logo:'' }));
+},
+async cards(set){
+const d = await binderFetch('https://api.lorcast.com/v0/sets/' + encodeURIComponent(set.code) + '/cards');
+return (Array.isArray(d) ? d : (d.results || [])).map(c=>({ id:c.id, name:c.name + (c.version ? ' – ' + c.version : ''), number:String(c.collector_number || ''), rarity:c.rarity || '', img:(c.image_uris && c.image_uris.digital && c.image_uris.digital.small) || '' }));
+} },
+riftbound: { label:'Riftbound (League of Legends)', re:/riftbound|league|\blol\b/i, key:bKey, source:'Riftcodex',
+async sets(){
+const d = await binderFetch(RIFT + 'sets');
+return (d.items || []).slice().sort((a, b)=>String(b.published_on || '').localeCompare(String(a.published_on || ''))).map(s=>({ id:s.set_id, name:s.name, code:s.set_id, series:'Riftbound', total:s.card_count || null, printedTotal:s.card_count || null, date:String(s.published_on || '').slice(0, 10), logo:'' }));
+},
+async cards(set){
+const out = []; const seen = new Set();
+const first = await binderFetch(RIFT + 'cards?size=100&page=1&set_id=' + encodeURIComponent(set.code));
+const pages = Math.min(first.pages || 1, 10);
+const rest = pages > 1 ? await Promise.all(Array.from({length:pages - 1}, (_, i)=>binderFetch(RIFT + 'cards?size=100&page=' + (i + 2) + '&set_id=' + encodeURIComponent(set.code)))) : [];
+[first].concat(rest).forEach(p=>(p.items || []).forEach(c=>{
+const n = String((c.riftbound_id || '').split('-')[1] || c.collector_number || '').replace(/[^A-Za-z0-9]/g, '');
+const k = bKey(n); if(!k || seen.has(k)) return; seen.add(k);
+out.push({ id:c.id, name:c.name || '', number:n || String(c.collector_number || ''), rarity:(c.classification && c.classification.rarity) || '', img:(c.media && c.media.image_url) || '' });
+}));
+return out;
+} },
+manual: { label:'Manuel (d\'après mes numéros)', re:null, key:bNum, source:'tes cartes' }
+};
+function binderDetect(cat){
+for(const k of Object.keys(BINDER_GAMES)){ const g = BINDER_GAMES[k]; if(g.re && g.re.test(cat || '')) return k; }
+return 'manual';
+}
+function binderGameFor(cat){
+const p = binderGamePref(cat);
+return (p && BINDER_GAMES[p]) ? p : binderDetect(cat);
+}
+/* mémoire + cache navigateur (listes d'extensions 7 j, cartes d'une extension 30 j) */
+async function binderLoadSets(game){
+if(binderState.mem['s:' + game]) return binderState.mem['s:' + game];
+const key = 'binder-sets-v2:' + game;
+let d = binderLsGet(key, 7*86400000);
+if(!d){ d = await BINDER_GAMES[game].sets(); binderLsSet(key, d); }
+binderState.mem['s:' + game] = d;
+return d;
+}
+async function binderLoadCards(game, set){
+const key = 'binder-cards-v2:' + game + ':' + set.id;
+let d = binderLsGet(key, 30*86400000);
+if(!d){
+d = await BINDER_GAMES[game].cards(set);
+if(binderLsSet(key, d)){
+try{
+const idx = JSON.parse(localStorage.getItem('binder-cards-index-v2') || '[]').filter(x=>x!==key);
+idx.push(key);
+while(idx.length > 14){ localStorage.removeItem(idx.shift()); }
+localStorage.setItem('binder-cards-index-v2', JSON.stringify(idx));
+}catch(e){}
+}
+}
+return d;
+}
+/* classeur « manuel » : les extensions viennent des cartes possédées, les emplacements du numéro total (12/50 -> 50) */
+function binderManualSets(mine){
+const by = new Map();
+mine.forEach(c=>{
+const name = String(c.set || '').trim() || 'Sans extension';
+if(!by.has(name)) by.set(name, []);
+by.get(name).push(c);
+});
+return [...by.entries()].map(([name, list])=>{
+const denom = Math.max(0, ...list.map(c=>bDenom(c.number)));
+return { id:'m:' + bNorm(name), name, code:'', series:'Mes extensions', total:denom || null, printedTotal:denom || null, date:'', logo:'', manual:true };
+}).sort((a, b)=>bNatCmp(a.name, b.name));
+}
+function binderManualCards(set){
+const n = Number(set.total) || 0;
+if(!n || n > 600) return [];
+return Array.from({length:n}, (_, i)=>({ id:'p' + (i + 1), name:'Carte ' + (i + 1), number:String(i + 1), rarity:'', img:'' }));
+}
+/* quelles cartes possédées appartiennent à une extension ? */
+function binderCtx(sets){
+const known = new Set(); const uniq = new Map();
+sets.forEach(s=>{ known.add(bNorm(s.name)); if(s.code) known.add(bNorm(s.code)); const pt = Number(s.printedTotal) || 0; if(pt) uniq.set(pt, (uniq.get(pt) || 0) + 1); });
+return { known, uniq };
+}
+function binderCardInSet(G, c, set, ctx){
+if(set.manual) return (String(c.set || '').trim() || 'Sans extension') === set.name;
+const sn = bNorm(c.set);
+if(sn && (sn === bNorm(set.name) || (set.code && sn === bNorm(set.code)))) return true;
+if(G.prefix && set.code){
+const num = String(c.number || '');
+if(num.includes('-') && bNorm(num.split('-')[0]) === bNorm(set.code)) return true;
+}
+if(G.denom){
+const pt = Number(set.printedTotal) || 0;
+if(pt && ctx.uniq.get(pt) === 1 && !ctx.known.has(sn) && bDenom(c.number) === pt) return true;
+}
+return false;
 }
 function binderTile(o){
 const t = document.createElement('div');
 t.className = 'binder-tile' + (o.owned ? '' : ' missing');
 const img = document.createElement('div'); img.className = 'bt-img';
-if(o.img){ const im = document.createElement('img'); im.loading = 'lazy'; im.alt = ''; im.src = o.img; img.appendChild(im); }
+if(o.img){ const im = document.createElement('img'); im.loading = 'lazy'; im.alt = ''; im.referrerPolicy = 'no-referrer'; im.src = o.img; img.appendChild(im); }
 else { const n = document.createElement('div'); n.className = 'noimg'; n.textContent = o.name || '?'; img.appendChild(n); }
 const num = document.createElement('span'); num.className = 'bt-num'; num.textContent = o.number ? '#' + String(o.number).split('/')[0] : '';
 img.appendChild(num);
@@ -1489,7 +1645,7 @@ if(!cards.length){ host.insertAdjacentHTML('beforeend', '<div class="chart-empty
 const bySet = new Map();
 cards.forEach(c=>{ const k = c.set || 'Sans extension'; if(!bySet.has(k)) bySet.set(k, []); bySet.get(k).push(c); });
 [...bySet.keys()].sort(bNatCmp).forEach(k=>{
-const list = bySet.get(k).slice().sort((a,b)=>bNatCmp(bNum(a.number), bNum(b.number)) || bNatCmp(a.name, b.name));
+const list = bySet.get(k).slice().sort((a,b)=>bNatCmp(bKey(a.number), bKey(b.number)) || bNatCmp(a.name, b.name));
 const h = document.createElement('h3'); h.className = 'binder-set-title'; h.textContent = `${k} · ${list.length} carte${list.length>1?'s':''}`;
 host.appendChild(h);
 const g = document.createElement('div'); g.className = 'binder-grid';
@@ -1503,36 +1659,47 @@ if(!binderState.category || !state.categories.includes(binderState.category)){
 binderState.category = state.categories.find(isPokemonCat) || (state.categories.includes(state.activeCategory) && state.activeCategory) || state.categories[0];
 }
 const cat = binderState.category;
+const game = binderGameFor(cat);
+const G = BINDER_GAMES[game];
+const gameOpts = Object.keys(BINDER_GAMES).map(k=>`<option value="${k}" ${k===game?'selected':''}>${escapeHtml(BINDER_GAMES[k].label)}</option>`).join('');
 body.innerHTML = `
 <div class="filters-row">
 <select id="binderCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===cat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
+<select id="binderGame" title="Base de données utilisée pour cette série">${gameOpts}</select>
 <span id="binderSetBox" style="display:contents;"></span>
 </div>
+<div id="binderSrc" class="binder-src"></div>
 <div id="binderHost"></div>`;
-el('binderCat').onchange = e=>{ binderState.category = e.target.value; binderState.setId = ''; binderState.cards = null; renderBinder(el('viewBody')); };
+el('binderCat').onchange = e=>{ binderState.category = e.target.value; binderState.setId = ''; renderBinder(el('viewBody')); };
+el('binderGame').onchange = e=>{ binderGamePref(cat, e.target.value === binderDetect(cat) ? '' : e.target.value); binderState.setId = ''; renderBinder(el('viewBody')); };
+el('binderSrc').textContent = game === 'manual' ? 'Classeur construit à partir de tes cartes : les emplacements viennent du numéro total (ex. 12/50 → 50 cartes). Change la base ci-dessus si ta série existe dans une des bases.' : `Base de données : ${G.source}`;
 const host = el('binderHost');
 const mine = state.cards.filter(c=>c.category === cat);
-if(!isPokemonCat(cat)){
-binderShowOwnedOnly(host, mine, 'Pour l\'instant, les cartes manquantes en grisé sont disponibles pour les séries Pokémon. Ici, tes cartes sont classées par extension et par numéro.');
-return;
-}
 const token = ++binderState.token;
-host.innerHTML = '<div class="chart-empty">Chargement des extensions Pokémon…</div>';
-binderLoadSets().then(sets=>{
+if(game === 'manual'){ binderRenderSetPicker(game, binderManualSets(mine), mine, token); return; }
+host.innerHTML = `<div class="chart-empty">Chargement des extensions ${escapeHtml(G.label)}…</div>`;
+binderLoadSets(game).then(sets=>{
 if(token !== binderState.token) return;
-binderRenderSetPicker(sets, mine, token);
+binderRenderSetPicker(game, sets, mine, token);
 }).catch(()=>{
 if(token !== binderState.token) return;
-binderShowOwnedOnly(host, mine, 'Impossible de charger la liste des extensions (api.pokemontcg.io ne répond pas). Voici tes cartes en attendant — réessaie dans un moment.');
+binderShowOwnedOnly(host, mine, `Impossible de charger la liste des extensions (${G.source} ne répond pas). Voici tes cartes en attendant — réessaie dans un moment.`);
 const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>renderBinder(el('viewBody'));
 host.prepend(b);
 });
 }
-function binderRenderSetPicker(sets, mine, token){
+function binderRenderSetPicker(game, sets, mine, token){
 const cat = binderState.category;
-const known = binderKnown(sets);
+const G = BINDER_GAMES[game];
+const host = el('binderHost');
+if(!sets.length){
+binderShowOwnedOnly(host, mine, game === 'manual' ? 'Ajoute des cartes dans cette série pour voir ton classeur.' : 'Aucune extension trouvée.');
+el('binderSetBox').innerHTML = '';
+return;
+}
+const ctx = binderCtx(sets);
 const cnt = new Map();
-sets.forEach(s=>{ const n = mine.filter(c=>binderCardInSet(c, s, known)).length; if(n) cnt.set(s.id, n); });
+sets.forEach(s=>{ const n = mine.filter(c=>binderCardInSet(G, c, s, ctx)).length; if(n) cnt.set(s.id, n); });
 const ownedSets = sets.filter(s=>cnt.has(s.id)).sort((a,b)=>cnt.get(b.id) - cnt.get(a.id));
 let sel = binderState.setId && sets.some(s=>s.id===binderState.setId) ? binderState.setId : '';
 if(!sel){ const p = binderPref(cat); if(p && sets.some(s=>s.id===p)) sel = p; }
@@ -1541,11 +1708,11 @@ if(!sel && sets.length) sel = sets[0].id;
 binderState.setId = sel;
 const series = new Map();
 sets.forEach(s=>{ const k = s.series || 'Autres'; if(!series.has(k)) series.set(k, []); series.get(k).push(s); });
-const opt = s=>`<option value="${escapeHtml(s.id)}" ${s.id===sel?'selected':''}>${escapeHtml(s.name)} (${s.total||s.printedTotal||'?'})</option>`;
+const opt = s=>`<option value="${escapeHtml(s.id)}" ${s.id===sel?'selected':''}>${escapeHtml(s.name)}${(s.total||s.printedTotal) ? ' (' + (s.total||s.printedTotal) + ')' : ''}</option>`;
 const box = el('binderSetBox');
 box.innerHTML = `
 <select id="binderSet" style="min-width:220px;max-width:100%;">
-${ownedSets.length ? `<optgroup label="Mes extensions">${ownedSets.map(opt).join('')}</optgroup>` : ''}
+${ownedSets.length && game !== 'manual' ? `<optgroup label="Mes extensions">${ownedSets.map(opt).join('')}</optgroup>` : ''}
 ${[...series.keys()].map(k=>`<optgroup label="${escapeHtml(k)}">${series.get(k).map(opt).join('')}</optgroup>`).join('')}
 </select>
 <select id="binderFilter">
@@ -1554,58 +1721,66 @@ ${[...series.keys()].map(k=>`<optgroup label="${escapeHtml(k)}">${series.get(k).
 <option value="missing">Manquantes</option>
 </select>`;
 el('binderFilter').value = binderState.filter;
-el('binderSet').onchange = e=>{ binderState.setId = e.target.value; binderPref(cat, e.target.value); binderRenderSet(sets, mine, ++binderState.token); };
-el('binderFilter').onchange = e=>{ binderState.filter = e.target.value; binderRenderSet(sets, mine, ++binderState.token); };
-binderRenderSet(sets, mine, token);
+el('binderSet').onchange = e=>{ binderState.setId = e.target.value; binderPref(cat, e.target.value); binderRenderSet(game, sets, mine, ++binderState.token); };
+el('binderFilter').onchange = e=>{ binderState.filter = e.target.value; binderRenderSet(game, sets, mine, ++binderState.token); };
+binderRenderSet(game, sets, mine, token);
 }
-function binderRenderSet(sets, mine, token){
+function binderRenderSet(game, sets, mine, token){
 const host = el('binderHost');
 if(!host) return;
+const G = BINDER_GAMES[game];
 const set = sets.find(s=>s.id === binderState.setId);
 if(!set){ host.innerHTML = ''; return; }
 host.innerHTML = '<div class="chart-empty">Chargement de la liste des cartes…</div>';
-binderLoadCards(set.id).then(api=>{
+const loader = set.manual ? Promise.resolve(binderManualCards(set)) : binderLoadCards(game, set);
+loader.then(api=>{
 if(token !== binderState.token) return;
-const owned = binderOwnedFor(set, mine, binderKnown(sets));
+const ctx = binderCtx(sets);
+const owned = mine.filter(c=>binderCardInSet(G, c, set, ctx));
 const byNum = new Map();
-owned.forEach(c=>{ const k = bNum(c.number); if(!byNum.has(k)) byNum.set(k, []); byNum.get(k).push(c); });
-const apiSorted = api.slice().sort((a,b)=>bNatCmp(a.number, b.number));
-const apiKeys = new Set(apiSorted.map(c=>bNum(c.number)));
+owned.forEach(c=>{ const k = G.key(c.number); if(!byNum.has(k)) byNum.set(k, []); byNum.get(k).push(c); });
+const apiSorted = api.slice().sort((a,b)=>bNatCmp(G.key(a.number).padStart(6, '0'), G.key(b.number).padStart(6, '0')));
+const apiKeys = new Set(apiSorted.map(c=>G.key(c.number)));
 let have = 0;
 const rows = apiSorted.map(ac=>{
-const list = byNum.get(bNum(ac.number)) || [];
+const list = byNum.get(G.key(ac.number)) || [];
 if(list.length) have++;
 return {ac, list};
 });
-const unknown = owned.filter(c=>!apiKeys.has(bNum(c.number)));
+const unknown = owned.filter(c=>!apiKeys.has(G.key(c.number)));
 host.innerHTML = '';
 const head = document.createElement('div'); head.className = 'binder-head';
-if(set.images && set.images.logo){ const lg = document.createElement('img'); lg.src = set.images.logo; lg.alt = ''; lg.className = 'binder-logo'; head.appendChild(lg); }
+if(set.logo){ const lg = document.createElement('img'); lg.src = set.logo; lg.alt = ''; lg.className = 'binder-logo'; lg.referrerPolicy = 'no-referrer'; lg.onerror = ()=>lg.remove(); head.appendChild(lg); }
 const tt = document.createElement('div');
 tt.innerHTML = `<h2 class="display" style="margin:0 0 4px;font-size:20px;"></h2><div style="color:var(--ink-dim);font-size:12.5px;"></div>`;
 tt.querySelector('h2').textContent = set.name;
-tt.querySelector('div').textContent = `${set.series || ''}${set.releaseDate ? ' · ' + set.releaseDate.replace(/\//g,'-') : ''}`;
+tt.querySelector('div').textContent = `${set.series || ''}${set.date ? ' · ' + String(set.date).replace(/\//g,'-') : ''}`;
 head.appendChild(tt);
 host.appendChild(head);
+if(!apiSorted.length){
+const n = document.createElement('div'); n.className = 'binder-note'; n.textContent = set.manual ? 'Le nombre total de cartes de cette extension est inconnu (écris tes numéros sous la forme 12/50 pour afficher les emplacements manquants). Voici tes cartes :' : 'Aucune carte trouvée pour cette extension.';
+host.appendChild(n);
+}
 const secret = (set.printedTotal && apiSorted.length > set.printedTotal) ? `dont ${apiSorted.length - set.printedTotal} secrètes` : '';
 const copies = owned.length > have ? `${owned.reduce((s,c)=>s+Number(c.quantity||1),0)} exemplaires` : '';
-binderProgress(host, have, apiSorted.length, [secret, copies].filter(Boolean).join(' · '));
+if(apiSorted.length) binderProgress(host, have, apiSorted.length, [secret, copies].filter(Boolean).join(' · '));
 const f = binderState.filter;
 const shown = rows.filter(r=> f === 'all' || (f === 'owned' ? r.list.length : !r.list.length));
+if(apiSorted.length){
 const g = document.createElement('div'); g.className = 'binder-grid';
 if(!shown.length) g.innerHTML = '<div class="chart-empty" style="grid-column:1/-1;">' + (f === 'missing' ? 'Bravo, rien ne manque dans cette extension !' : 'Aucune carte à afficher.') + '</div>';
 shown.forEach(({ac, list})=>{
 const first = list[0];
 g.appendChild(binderTile({
-owned: !!list.length, img: ac.img, name: ac.name, number: ac.number,
+owned: !!list.length, img: list.length && first.image ? first.image : ac.img, name: list.length ? first.name : ac.name, number: ac.number,
 qty: list.reduce((s,c)=>s+Number(c.quantity||1),0),
-onclick: first ? ()=>setView('detail', {id:first.id}) : ()=>showToast(`Il te manque : ${ac.name} (#${bNum(ac.number)})`)
+onclick: first ? ()=>setView('detail', {id:first.id}) : ()=>showToast(`Il te manque : ${ac.name} (#${String(ac.number).split('/')[0]})`)
 }));
 });
 host.appendChild(g);
+}
 if(unknown.length){
-const h = document.createElement('h3'); h.className = 'binder-set-title'; h.textContent = `Autres cartes de cette extension (${unknown.length}) — numéro non reconnu`;
-host.appendChild(h);
+if(apiSorted.length){ const h = document.createElement('h3'); h.className = 'binder-set-title'; h.textContent = `Autres cartes de cette extension (${unknown.length}) — numéro non reconnu`; host.appendChild(h); }
 const g2 = document.createElement('div'); g2.className = 'binder-grid';
 unknown.forEach(c=>g2.appendChild(binderTile({owned:true, img:c.image, name:c.name, number:c.number, qty:c.quantity||1, onclick:()=>setView('detail', {id:c.id})})));
 host.appendChild(g2);
@@ -1613,9 +1788,9 @@ host.appendChild(g2);
 }).catch(()=>{
 if(token !== binderState.token) return;
 host.innerHTML = '';
-const n = document.createElement('div'); n.className = 'binder-note'; n.textContent = 'Impossible de charger la liste des cartes de cette extension (api.pokemontcg.io est lent ou indisponible).';
+const n = document.createElement('div'); n.className = 'binder-note'; n.textContent = `Impossible de charger la liste des cartes de cette extension (${G.source} est lent ou indisponible).`;
 host.appendChild(n);
-const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>binderRenderSet(sets, mine, ++binderState.token);
+const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>binderRenderSet(game, sets, mine, ++binderState.token);
 host.appendChild(b);
 });
 }

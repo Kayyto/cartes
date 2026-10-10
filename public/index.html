@@ -522,6 +522,7 @@ const NAV_ITEMS = [
   {id:'catalogue', label:'Catalogue'},
   {id:'collections', label:'Mes séries'},
 {id:'binder', label:'Classeur'},
+{id:'autoscan', label:'Scan en lot'},
   {id:'wishlist', label:'Ma wishlist'},
   {id:'settings', label:'Paramètres'},
 ];
@@ -750,6 +751,7 @@ function renderTopbar(){
     dashboard: ['Tableau de bord', greetingSub()],
     catalogue: ['Catalogue', 'Parcours et filtre toutes tes cartes.'],
     collections: ['Mes séries', 'Une série par jeu ou univers de cartes.'],
+autoscan: ['Scan en lot', 'Ajoute tes cartes en photo : l\'image officielle est trouvée automatiquement.'],
 binder: ['Classeur', 'Ta collection extension par extension, avec les cartes manquantes en grisé.'],
     wishlist: ['Ma wishlist', 'Les cartes que tu veux ajouter à ta collection.'],
     settings: ['Paramètres', 'Personnalise l\'app et gère ton compte.'],
@@ -796,6 +798,7 @@ function renderViewBody(){
   if(view === 'catalogue') return renderCatalogue(body);
   if(view === 'collections') return renderCollections(body);
 if(view === 'binder') return renderBinder(body);
+if(view === 'autoscan') return renderAutoScan(body);
   if(view === 'wishlist') return renderWishlist(body);
   if(view === 'settings') return renderSettings(body);
   if(view === 'detail') return renderDetail(body);
@@ -1067,6 +1070,303 @@ function deleteCategory(name){
   recordValueSnapshot();
   saveState();
   renderAll();
+}
+
+/* ================= IMAGE AUTO (TCGdex) ================= */
+const autoState = { running:false, stop:false, done:0, total:0, added:0, merged:0, review:[], fill:{ running:false, stop:false, done:0, total:0, applied:0, review:[] }, saving:null, unsaved:0 };
+
+function mapPokeRarity(raw){
+const s = String(raw||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
+if(!s) return 'Commun';
+if(/secret|hyper|rainbow|arc-en-ciel/.test(s)) return 'Mythique';
+if(/special illustration|illustration speciale|ultra|noir et blanc|black white|gold|\bor\b/.test(s)) return 'Légendaire';
+if(/illustration|double|holo|vmax|vstar|\bex\b|\bgx\b|\bv\b|radiant|chromatique|shiny|amazing|prism/.test(s)) return 'Épique';
+if(/rare/.test(s)) return 'Rare';
+return 'Commun';
+}
+async function matchCardApi(p){
+const qs = new URLSearchParams({ game: p.game||'', name: p.name||'', number: p.number||'', set: p.set||'', lang: p.language||'' });
+const res = await fetch('/api/match?' + qs.toString());
+if(!res.ok) throw new Error('HTTP ' + res.status);
+return await res.json();
+}
+function cardDataFromMatch(c){
+return { name:c.name, set:c.set, number:c.number, language:c.language, price:c.price||0, illustrator:c.illustrator||'', rarity:mapPokeRarity(c.rarity), image:c.image||'' };
+}
+
+/* ---- dans la fenêtre d'ajout d'une carte ---- */
+function applyMatchToForm(c){
+el('f_name').value = c.name; el('f_set').value = c.set; el('f_number').value = c.number; el('f_language').value = c.language;
+fillRaritySelect(mapPokeRarity(c.rarity));
+if(c.illustrator) el('f_illustrator').value = c.illustrator;
+if(c.price && !(parseFloat(el('f_price').value) > 0)) el('f_price').value = Number(c.price).toFixed(2);
+if(c.image){
+imgMode = 'url';
+document.querySelectorAll('.imgtab').forEach(t=>t.classList.toggle('active', t.dataset.mode==='url'));
+el('f_imageUrl').style.display = 'block'; el('f_imageFile').style.display = 'none';
+el('f_imageUrl').value = c.image; pendingImage = '';
+el('imgPreview').style.display = 'block'; el('imgPreviewImg').src = c.image;
+}
+}
+function renderMatchCandidates(list, host, onPick){
+host.innerHTML = '';
+list.forEach(c=>{
+const row = document.createElement('div'); row.className = 'result-row';
+const im = document.createElement('img'); im.src = c.thumb || c.image || ''; row.appendChild(im);
+const box = document.createElement('div');
+const pn = document.createElement('div'); pn.className = 'pn'; pn.textContent = c.name;
+const ps = document.createElement('div'); ps.className = 'ps'; ps.textContent = `${c.set} · ${c.number}${c.rarity ? ' · ' + c.rarity : ''}`;
+box.appendChild(pn); box.appendChild(ps); row.appendChild(box);
+row.onclick = ()=>onPick(c);
+host.appendChild(row);
+});
+}
+async function autoMatchForm(){
+const status = el('scanStatus'); status.style.display = 'block'; status.className = 'scan-status';
+const p = { game: currentFormCategory(), name: el('f_name').value.trim(), number: el('f_number').value.trim(), set: el('f_set').value.trim(), language: el('f_language').value };
+if(!p.name && !(p.set && p.number)){ status.textContent = "Renseigne le nom (ou l'extension et le numéro) pour la recherche automatique."; return; }
+status.textContent = 'Recherche de la carte dans la base Pokémon…';
+try{
+const r = await matchCardApi(p);
+if(r.status === 'sure'){
+applyMatchToForm(r.card); el('pokeResults').innerHTML = '';
+status.textContent = `Carte trouvée automatiquement : ${r.card.name} — ${r.card.set} ${r.card.number}. Vérifie puis enregistre.`;
+status.classList.add('ready');
+} else if(r.status === 'maybe'){
+renderMatchCandidates(r.candidates || [], el('pokeResults'), c=>{ applyMatchToForm(c); el('pokeResults').innerHTML = ''; status.textContent = 'Carte choisie. Vérifie puis enregistre.'; status.classList.add('ready'); });
+status.textContent = 'Plusieurs cartes possibles : choisis la bonne dans la liste.';
+} else {
+status.textContent = 'Aucune correspondance. Vérifie le nom et le numéro, ou renseigne la carte à la main.';
+}
+}catch(e){ status.textContent = 'Recherche automatique impossible (' + e.message + ').'; }
+}
+(function(){
+const f = el('pokeSearchField');
+if(!f || el('autoMatchBtn')) return;
+const b = document.createElement('button');
+b.type = 'button'; b.id = 'autoMatchBtn'; b.className = 'btn sm'; b.style.marginTop = '8px';
+b.textContent = '✨ Trouver la carte et son image automatiquement';
+b.onclick = autoMatchForm;
+f.appendChild(b);
+})();
+
+/* ---- aides ---- */
+function autoNewCard(category, d){
+return { id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()+Math.random())), category, name:d.name, set:d.set||'', number:d.number||'', language:d.language||'Français', quantity:d.quantity||1, condition:d.condition||'', price:d.price||0, illustrator:d.illustrator||'', rarity:d.rarity||'Commun', image:d.image||'', notes:'', wishlist:false, priceHistory:[{ date: todayISO(), price: d.price||0 }] };
+}
+function autoFindExisting(category, d){
+return state.cards.find(x=>x.category === category && bNorm(x.name) === bNorm(d.name) && bNum(x.number) === bNum(d.number) && (!x.set || !d.set || bNorm(x.set) === bNorm(d.set)));
+}
+function autoAddOrMerge(category, d){
+const ex = autoFindExisting(category, d);
+if(ex){ ex.quantity = Number(ex.quantity||1) + 1; if(!ex.image && d.image) ex.image = d.image; return 'merged'; }
+state.cards.push(autoNewCard(category, d));
+return 'added';
+}
+function autoSaveNow(){
+autoState.unsaved = 0;
+autoState.saving = (autoState.saving || Promise.resolve()).then(()=>{ recordValueSnapshot(); return saveState(); }).catch(()=>{});
+return autoState.saving;
+}
+function autoSaveTick(){ autoState.unsaved++; if(autoState.unsaved >= 20) return autoSaveNow(); return null; }
+const autoSleep = ms => new Promise(r=>setTimeout(r, ms));
+
+/* ---- scan en lot automatique ---- */
+async function autoVision(file){
+const dataUrl = await resizeImageFile(file, 900);
+let lastErr;
+for(let i=0;i<2;i++){
+try{
+const res = await fetch('/api/vision', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ imageBase64: dataUrl.split(',')[1] }) });
+const infos = await res.json();
+if(!res.ok) throw new Error(infos.error || 'Erreur IA');
+return infos;
+}catch(e){ lastErr = e; await autoSleep(1500); }
+}
+throw lastErr;
+}
+async function processOnePhoto(file, category, autoAdd){
+let thumb = '';
+try{ thumb = await resizeImageFile(file, 160); }catch(e){}
+let infos;
+try{ infos = await autoVision(file); }
+catch(e){ autoState.review.push({ thumb, base:{name:'',set:'',number:'',language:'Français'}, category, candidates:[], error:'Lecture par l\'IA impossible (' + e.message + ')' }); return; }
+const base = { name: infos.nom || '', set: infos.set || '', number: infos.numero || '', language: 'Français', rarity: mapPokeRarity(infos.rarete) };
+if(!base.name && !(base.set && base.number)){ autoState.review.push({ thumb, base, category, candidates:[], error:'Rien de lisible sur cette photo' }); return; }
+let r = null;
+if(isPokemonCat(category)){ try{ r = await matchCardApi({ game:category, ...base }); }catch(e){} }
+if(r && r.status === 'sure' && autoAdd){
+const kind = autoAddOrMerge(category, cardDataFromMatch(r.card));
+autoState[kind === 'added' ? 'added' : 'merged']++;
+await autoSaveTick();
+return;
+}
+const cands = r && r.status === 'maybe' ? r.candidates : (r && r.status === 'sure' ? [r.card] : []);
+autoState.review.push({ thumb, base, category, candidates: cands, error: r && r.status === 'none' ? 'Aucune correspondance dans la base' : (!isPokemonCat(category) ? 'Pas de base automatique pour ce jeu (image à ajouter à la main)' : '') });
+}
+async function runAutoScan(files, category, autoAdd){
+if(autoState.running) return;
+Object.assign(autoState, { running:true, stop:false, done:0, total:files.length, added:0, merged:0 });
+updateAutoUI();
+let next = 0;
+const worker = async ()=>{
+while(!autoState.stop){
+const i = next++; if(i >= files.length) break;
+try{ await processOnePhoto(files[i], category, autoAdd); }catch(e){}
+autoState.done++; updateAutoUI();
+}
+};
+await Promise.all([worker(), worker()]);
+if(autoState.added || autoState.merged) logActivity(`Scan en lot : ${autoState.added} carte(s) ajoutée(s), ${autoState.merged} doublon(s)`);
+await autoSaveNow();
+autoState.running = false;
+showToast(autoState.stop ? 'Scan arrêté.' : 'Scan en lot terminé.');
+updateAutoUI();
+}
+function autoReviewAdd(item, d){
+const kind = autoAddOrMerge(item.category, d);
+autoState[kind === 'added' ? 'added' : 'merged']++;
+autoState.review = autoState.review.filter(x=>x!==item);
+autoSaveTick(); updateAutoUI();
+}
+
+/* ---- compléter les images des cartes déjà dans l'app ---- */
+function autoFillTargets(replacePhotos){
+return state.cards.filter(c=>isPokemonCat(c.category) && (!c.image || (replacePhotos && String(c.image).startsWith('data:'))));
+}
+function autoApplyToCard(card, c){
+card.image = c.image || card.image;
+if(!card.illustrator && c.illustrator) card.illustrator = c.illustrator;
+if((!card.rarity || card.rarity === 'Commun') && c.rarity) card.rarity = mapPokeRarity(c.rarity);
+if(!card.number) card.number = c.number; else if(!String(card.number).includes('/') && c.number.includes('/')) card.number = c.number;
+if(!(Number(card.price) > 0) && c.price){
+card.price = c.price;
+const h = card.priceHistory || (card.priceHistory = []);
+if(h.length && h[h.length-1].date === todayISO()) h[h.length-1].price = c.price; else h.push({ date: todayISO(), price: c.price });
+}
+}
+async function runAutoFill(replacePhotos){
+const f = autoState.fill;
+if(f.running) return;
+const targets = autoFillTargets(replacePhotos);
+Object.assign(f, { running:true, stop:false, done:0, total:targets.length, applied:0, review:[] });
+updateAutoUI();
+let next = 0;
+const worker = async ()=>{
+while(!f.stop){
+const i = next++; if(i >= targets.length) break;
+const card = targets[i];
+try{
+const r = await matchCardApi({ game:card.category, name:card.name, number:card.number, set:card.set, language:card.language });
+if(r.status === 'sure'){ autoApplyToCard(card, r.card); f.applied++; await autoSaveTick(); }
+else f.review.push({ card, candidates: r.status === 'maybe' ? r.candidates : [], error: r.status === 'none' ? 'Aucune correspondance' : '' });
+}catch(e){ f.review.push({ card, candidates:[], error:'Recherche impossible' }); }
+f.done++; updateAutoUI();
+}
+};
+await Promise.all([worker(), worker(), worker()]);
+if(f.applied) logActivity(`Images automatiques : ${f.applied} carte(s) complétée(s)`);
+await autoSaveNow();
+f.running = false;
+showToast(f.stop ? 'Recherche arrêtée.' : 'Recherche des images terminée.');
+updateAutoUI();
+}
+
+/* ---- page « Scan en lot » ---- */
+function renderAutoScan(body){
+if(!state.categories.length){ body.innerHTML = emptyStateHtml(); wireEmptyState(); return; }
+const pokeCat = state.categories.find(isPokemonCat) || state.categories[0];
+body.innerHTML = `
+<div class="panel" style="margin-bottom:16px;">
+<h3>Scanner des photos en lot</h3>
+<p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Choisis plusieurs photos de cartes (une carte par photo). L'IA lit chaque carte, l'app retrouve l'image officielle en français et les ajoute toutes seules quand elle est sûre. Les cas douteux vont dans la liste à vérifier plus bas. Garde cet onglet ouvert pendant le traitement.</p>
+<div class="filters-row">
+<select id="autoCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===pokeCat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
+<input type="file" id="autoFiles" accept="image/*" multiple>
+<label style="font-size:13px;display:flex;gap:6px;align-items:center;"><input type="checkbox" id="autoAdd" checked> Ajouter automatiquement les cartes sûres</label>
+</div>
+<div class="filters-row"><button class="btn" id="autoStart">Lancer le scan</button><button class="btn ghost" id="autoStop" style="display:none;">Arrêter</button></div>
+<div id="autoBar"></div>
+</div>
+<div class="panel" style="margin-bottom:16px;">
+<h3>Compléter les images des cartes déjà ajoutées</h3>
+<p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Pour les cartes Pokémon sans image, l'app cherche la carte (nom, numéro, extension) et ajoute l'image officielle, l'illustrateur et le prix si absents.</p>
+<div class="filters-row"><span id="fillCount" style="font-size:13px;"></span>
+<label style="font-size:13px;display:flex;gap:6px;align-items:center;"><input type="checkbox" id="fillReplace"> Remplacer aussi mes photos par l'image officielle</label></div>
+<div class="filters-row"><button class="btn" id="fillStart">Chercher les images</button><button class="btn ghost" id="fillStop" style="display:none;">Arrêter</button></div>
+<div id="fillBar"></div>
+</div>
+<div class="panel"><h3>À vérifier</h3><div id="autoReview"></div></div>`;
+el('autoStart').onclick = ()=>{
+const files = Array.from(el('autoFiles').files || []);
+if(!files.length){ showToast('Choisis d\'abord des photos.'); return; }
+runAutoScan(files, el('autoCat').value, el('autoAdd').checked);
+};
+el('autoStop').onclick = ()=>{ autoState.stop = true; };
+el('fillStart').onclick = ()=>runAutoFill(el('fillReplace').checked);
+el('fillStop').onclick = ()=>{ autoState.fill.stop = true; };
+el('fillReplace').onchange = updateAutoUI;
+updateAutoUI();
+}
+function autoBarHtml(done, total, extra){
+const pct = total ? Math.round(done/total*100) : 0;
+return `<div class="bp-top"><b>${done} / ${total}</b> · ${pct} %${extra ? ' · ' + escapeHtml(extra) : ''}</div><div class="bp-bar"><div style="width:${pct}%"></div></div>`;
+}
+function updateAutoUI(){
+if(view !== 'autoscan' || !el('autoBar')) return;
+const a = autoState, f = autoState.fill;
+el('autoBar').innerHTML = (a.total ? autoBarHtml(a.done, a.total, `${a.added} ajoutée(s), ${a.merged} doublon(s), ${a.review.length} à vérifier`) : '');
+el('autoStart').disabled = a.running; el('autoStop').style.display = a.running ? 'inline-block' : 'none';
+const n = autoFillTargets(el('fillReplace') && el('fillReplace').checked).length;
+el('fillCount').textContent = `${n} carte(s) Pokémon à compléter.`;
+el('fillBar').innerHTML = (f.total ? autoBarHtml(f.done, f.total, `${f.applied} complétée(s), ${f.review.length} à vérifier`) : '');
+el('fillStart').disabled = f.running || !n; el('fillStop').style.display = f.running ? 'inline-block' : 'none';
+renderAutoReview();
+}
+function renderAutoReview(){
+const host = el('autoReview'); if(!host) return;
+host.innerHTML = '';
+const f = autoState.fill;
+if(!autoState.review.length && !f.review.length){ host.innerHTML = '<div class="chart-empty">Rien à vérifier pour l\'instant.</div>'; return; }
+const mkRow = (thumbSrc, title, sub, err)=>{
+const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--line);';
+if(thumbSrc){ const im = document.createElement('img'); im.src = thumbSrc; im.style.cssText = 'width:64px;border-radius:6px;'; row.appendChild(im); }
+const box = document.createElement('div'); box.style.cssText = 'flex:1;min-width:0;';
+const t = document.createElement('div'); t.style.fontWeight = '600'; t.textContent = title; box.appendChild(t);
+const s = document.createElement('div'); s.style.cssText = 'font-size:12px;color:var(--ink-dim);'; s.textContent = [sub, err].filter(Boolean).join(' · '); box.appendChild(s);
+row.appendChild(box); host.appendChild(row);
+return box;
+};
+const btn = (label, fn, ghost)=>{ const b = document.createElement('button'); b.className = 'btn sm' + (ghost ? ' ghost' : ''); b.style.margin = '6px 6px 0 0'; b.textContent = label; b.onclick = fn; return b; };
+autoState.review.slice(0, 60).forEach(item=>{
+const box = mkRow(item.thumb, item.base.name || '(illisible)', `${item.base.set || ''} ${item.base.number || ''}`.trim(), item.error);
+const cands = document.createElement('div'); cands.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;';
+item.candidates.forEach(c=>{
+const b = document.createElement('div'); b.style.cssText = 'cursor:pointer;width:84px;font-size:10.5px;text-align:center;';
+const im = document.createElement('img'); im.src = c.thumb || c.image; im.style.cssText = 'width:84px;border-radius:5px;border:1px solid var(--line);';
+const tx = document.createElement('div'); tx.textContent = `${c.name} ${c.number}`;
+b.appendChild(im); b.appendChild(tx); b.onclick = ()=>autoReviewAdd(item, cardDataFromMatch(c)); cands.appendChild(b);
+});
+box.appendChild(cands);
+if(item.base.name){ box.appendChild(btn('Ajouter tel quel (sans image)', ()=>autoReviewAdd(item, { name:item.base.name, set:item.base.set, number:item.base.number, language:'Français', rarity:item.base.rarity }), true)); }
+box.appendChild(btn('Ignorer', ()=>{ autoState.review = autoState.review.filter(x=>x!==item); updateAutoUI(); }, true));
+});
+f.review.slice(0, 60).forEach(item=>{
+const c0 = item.card;
+const box = mkRow(c0.image, c0.name, `${c0.set || ''} ${c0.number || ''}`.trim(), item.error);
+const cands = document.createElement('div'); cands.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-top:6px;';
+item.candidates.forEach(c=>{
+const b = document.createElement('div'); b.style.cssText = 'cursor:pointer;width:84px;font-size:10.5px;text-align:center;';
+const im = document.createElement('img'); im.src = c.thumb || c.image; im.style.cssText = 'width:84px;border-radius:5px;border:1px solid var(--line);';
+const tx = document.createElement('div'); tx.textContent = `${c.set} ${c.number}`;
+b.appendChild(im); b.appendChild(tx);
+b.onclick = ()=>{ autoApplyToCard(c0, c); autoState.fill.applied++; autoState.fill.review = autoState.fill.review.filter(x=>x!==item); autoSaveTick(); updateAutoUI(); };
+cands.appendChild(b);
+});
+box.appendChild(cands);
+box.appendChild(btn('Ignorer', ()=>{ autoState.fill.review = autoState.fill.review.filter(x=>x!==item); updateAutoUI(); }, true));
+});
+if(autoState.review.length > 60 || f.review.length > 60){ const m = document.createElement('div'); m.className = 'binder-note'; m.textContent = 'Seules les 60 premières lignes de chaque liste sont affichées ; les autres apparaîtront après traitement des premières.'; host.appendChild(m); }
 }
 
 /* ================= CLASSEUR ================= */
@@ -1854,6 +2154,7 @@ el('aiScanBtn').addEventListener('click', async ()=>{
     if(infos.rarete){
       fillRaritySelect(mapRarityGuess(infos.rarete));
     }
+    if(isPokemonCat(currentFormCategory())) setTimeout(autoMatchForm, 0);
     status.textContent = infos.jeu ? `Détecté : ${infos.nom || '?'} (${infos.jeu}). Vérifie avant d'enregistrer.` : "Analyse terminée, vérifie les champs.";
     status.classList.add('ready');
   }catch(err){ status.textContent = "L'analyse a échoué (" + err.message + "). Renseigne la carte manuellement."; }

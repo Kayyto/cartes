@@ -25,3 +25,8 @@ service = "kayto-compte"
 [[services]]
 binding = "OUTILS"
 service = "serveur-carte"
+
+# Photos perso des cartes (R2) : une photo = un objet « <compte>/<empreinte> », servie par /api/photo/<empreinte>.
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "cartes-photos"

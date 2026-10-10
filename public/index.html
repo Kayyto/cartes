@@ -666,8 +666,11 @@ async function loadState(){
 
   if(remoteData){
     state = Object.assign(state, remoteData);
+    if(!Array.isArray(state.cards)) state.cards = [];
     if(!state.activeCategory && state.categories.length) state.activeCategory = state.categories[0];
     try{ await idbSet(key, JSON.stringify(state)); }catch(e){}
+    snapshotAll();
+    queueLegacyPhotos();
   } else if(fetchFailed){
     try{
       const cached = await idbGet(key);
@@ -694,17 +697,99 @@ async function loadState(){
   renderAll();
 }
 
-async function saveState(){
+/* ===== sauvegarde carte par carte =====
+   Le serveur garde une ligne par carte (+ une ligne « réglages ») et les photos perso dans R2.
+   On mémorise ce que le serveur a déjà (syncSnap) et on n'envoie que les cartes modifiées / supprimées. */
+const isDataUrl = s => typeof s === 'string' && s.startsWith('data:');
+const isOwnPhoto = s => typeof s === 'string' && (s.startsWith('data:') || s.startsWith('/api/photo/'));
+let syncSnap = { cards: new Map(), meta: '' };
+function splitState(){ const meta = Object.assign({}, state); delete meta.cards; return meta; }
+function snapshotAll(){
+  syncSnap.cards = new Map((state.cards || []).map(c=>[c.id, JSON.stringify(c)]));
+  syncSnap.meta = JSON.stringify(splitState());
+}
+// Photos encore en « data: » (ancienne version) : on les renvoie pour que le serveur les range dans R2.
+function queueLegacyPhotos(){
+  let n = 0;
+  (state.cards || []).forEach(c=>{ if(isDataUrl(c.image)){ syncSnap.cards.delete(c.id); n++; } });
+  const backs = Object.values(state.cardBacks || {}).some(isDataUrl);
+  if(backs) syncSnap.meta = '';
+  if(n || backs){
+    showToast(n ? `Migration de ${n} photo${n>1?'s':''} vers le stockage dédié…` : 'Migration des versos…');
+    saveState().then(()=>{ if(n) showToast('Photos migrées ✔'); });
+  }
+}
+let savingNow = null, saveAgain = false;
+function saveState(){
+  if(savingNow){ saveAgain = true; return savingNow; }
+  savingNow = (async ()=>{
+    try{ do{ saveAgain = false; await doSaveState(); }while(saveAgain); }
+    finally{ savingNow = null; }
+  })();
+  return savingNow;
+}
+async function postSync(body){
+  const res = await fetch('/api/sync', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+  const j = await res.json().catch(()=>({}));
+  if(!res.ok) throw new Error(j.error || ('HTTP ' + res.status));
+  return j;
+}
+async function doSaveState(){
   const key = dataKey();
   if(!key) return;
   try{ await idbSet(key, JSON.stringify(state)); }catch(e){}
   try{
-    const res = await fetch('/api/data', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: state })
-    });
-    if(!res.ok) throw new Error('save failed');
+    const metaStr = JSON.stringify(splitState());
+    const metaChanged = metaStr !== syncSnap.meta;
+    const seen = new Set(), changed = [];
+    for(const c of state.cards){
+      seen.add(c.id);
+      const str = JSON.stringify(c);
+      if(syncSnap.cards.get(c.id) !== str) changed.push({ id:c.id, str, photo: isDataUrl(c.image) });
+    }
+    const removed = [];
+    for(const id of syncSnap.cards.keys()) if(!seen.has(id)) removed.push(id);
+    if(!changed.length && !removed.length && !metaChanged) return;
+
+    const reqs = [];
+    for(let i = 0; i < removed.length; i += 1000) reqs.push({ remove: removed.slice(i, i + 1000), items: [] });
+    let cur = { items: [], size: 0, photos: 0 };
+    for(const it of changed){
+      if(cur.items.length && (cur.items.length >= 100 || cur.size + it.str.length > 2500000 || (it.photo && cur.photos >= 15))){ reqs.push(cur); cur = { items: [], size: 0, photos: 0 }; }
+      cur.items.push(it); cur.size += it.str.length; if(it.photo) cur.photos++;
+    }
+    if(cur.items.length) reqs.push(cur);
+    if(metaChanged){
+      if(!reqs.length) reqs.push({ items: [] });
+      reqs[reqs.length - 1].metaStr = metaStr;
+    }
+    let skipped = 0;
+    for(const r of reqs){
+      const byId = new Map(state.cards.map(c=>[c.id, c]));
+      const body = { upsert: r.items.map(it=>byId.get(it.id) ? JSON.parse(it.str) : null).filter(Boolean) };
+      if(r.remove) body.remove = r.remove;
+      if(r.metaStr) body.meta = JSON.parse(r.metaStr);
+      const j = await postSync(body);
+      if(j.skipped){ skipped += j.skipped; }
+      else{
+        r.items.forEach(it=>syncSnap.cards.set(it.id, it.str));
+      }
+      (r.remove || []).forEach(id=>syncSnap.cards.delete(id));
+      for(const [id, url] of Object.entries(j.images || {})){
+        const c = byId.get(id);
+        if(c && isDataUrl(c.image)){ c.image = url; syncSnap.cards.set(id, JSON.stringify(c)); }
+      }
+      if(r.metaStr){
+        let sent = JSON.parse(r.metaStr);
+        const bk = j.backs || {};
+        if(Object.keys(bk).length && sent.cardBacks){
+          sent.cardBacks = Object.assign({}, sent.cardBacks, bk);
+          for(const [k, url] of Object.entries(bk)){ if(state.cardBacks && isDataUrl(state.cardBacks[k])) state.cardBacks[k] = url; }
+        }
+        syncSnap.meta = JSON.stringify(sent);
+      }
+    }
+    if(skipped) showToast(skipped + ' carte(s) trop volumineuse(s) pour être sauvegardées (photo trop lourde ?).');
   }catch(e){
     showToast("Échec de synchronisation en ligne (gardé en local).");
   }
@@ -1235,7 +1320,7 @@ autoSaveTick(); updateAutoUI();
 
 /* ---- compléter les images des cartes déjà dans l'app ---- */
 function autoFillTargets(replacePhotos){
-return state.cards.filter(c=>isPokemonCat(c.category) && (!c.image || (replacePhotos && String(c.image).startsWith('data:'))));
+return state.cards.filter(c=>isPokemonCat(c.category) && (!c.image || (replacePhotos && isOwnPhoto(c.image))));
 }
 function autoApplyToCard(card, c){
 card.image = c.image || card.image;
@@ -2139,8 +2224,8 @@ function openCardModal(cardId, presetFile){
     el('f_price').value = card.price || '';
     el('f_illustrator').value = card.illustrator || '';
     fillRaritySelect(card.rarity);
-    el('f_imageUrl').value = card.image && card.image.startsWith('data:') ? '' : (card.image || '');
-    pendingImage = card.image && card.image.startsWith('data:') ? card.image : '';
+    el('f_imageUrl').value = isOwnPhoto(card.image) ? '' : (card.image || '');
+    pendingImage = isOwnPhoto(card.image) ? card.image : '';
     el('imgPreview').style.display = card.image ? 'block' : 'none';
     if(card.image) el('imgPreviewImg').src = card.image;
     el('deleteCardBtn').style.display = 'inline-block';
@@ -2463,7 +2548,7 @@ el('cardForm').addEventListener('submit', (e)=>{
   const raritySel = el('f_rarity').value;
 
   const urlVal = el('f_imageUrl').value.trim();
-  const finalImage = imgMode==='file' ? pendingImage : urlVal;
+  const finalImage = imgMode==='file' ? pendingImage : (urlVal || pendingImage);
   const newPrice = Math.max(0, parseFloat(el('f_price').value) || 0);
 
   const cardData = {

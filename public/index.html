@@ -1091,7 +1091,7 @@ async function binderFetch(url){
 let lastErr;
 for(let i=0;i<3;i++){
 const ctl = new AbortController();
-const to = setTimeout(()=>ctl.abort(), 30000);
+const to = setTimeout(()=>ctl.abort(), 60000);
 try{
 const r = await fetch(url, {signal: ctl.signal});
 clearTimeout(to);
@@ -1103,13 +1103,14 @@ await new Promise(res=>setTimeout(res, 700*(i+1)));
 throw lastErr;
 }
 async function binderFetchAll(path, extra){
-let page = 1, out = [], total = Infinity;
-while(out.length < total && page < 12){
-const j = await binderFetch(`${BINDER_API}${path}?${extra}&pageSize=250&page=${page}`);
-total = j.totalCount || 0;
-out = out.concat(j.data || []);
-if(!(j.data || []).length) break;
-page++;
+const size = 100;
+const first = await binderFetch(`${BINDER_API}${path}?${extra}&pageSize=${size}&page=1`);
+const total = first.totalCount || (first.data || []).length;
+let out = (first.data || []).slice();
+const pages = Math.min(Math.ceil(total / size), 15);
+if(pages > 1){
+const rest = await Promise.all(Array.from({length: pages - 1}, (_, i)=>binderFetch(`${BINDER_API}${path}?${extra}&pageSize=${size}&page=${i + 2}`)));
+rest.forEach(j=>{ out = out.concat(j.data || []); });
 }
 return out;
 }
@@ -1127,7 +1128,7 @@ async function binderLoadCards(setId){
 const key = 'binder-cards-v1:' + setId;
 let d = binderLsGet(key, 30*86400000);
 if(!d){
-d = await binderFetchAll('cards', `q=set.id:${encodeURIComponent(setId)}&orderBy=number&select=id,name,number,rarity,images`);
+d = await binderFetchAll('cards', `q=set.id:${encodeURIComponent(setId)}&select=id,name,number,rarity,images`);
 d = d.map(c=>({id:c.id, name:c.name, number:c.number, rarity:c.rarity||'', img:(c.images&&c.images.small)||''}));
 if(binderLsSet(key, d)){
 try{
@@ -1199,7 +1200,7 @@ host.appendChild(g);
 function renderBinder(body){
 if(!state.categories.length){ body.innerHTML = emptyStateHtml(); wireEmptyState(); return; }
 if(!binderState.category || !state.categories.includes(binderState.category)){
-binderState.category = (state.categories.includes(state.activeCategory) && state.activeCategory) || state.categories.find(isPokemonCat) || state.categories[0];
+binderState.category = state.categories.find(isPokemonCat) || (state.categories.includes(state.activeCategory) && state.activeCategory) || state.categories[0];
 }
 const cat = binderState.category;
 body.innerHTML = `
@@ -1222,7 +1223,7 @@ if(token !== binderState.token) return;
 binderRenderSetPicker(sets, mine, token);
 }).catch(()=>{
 if(token !== binderState.token) return;
-binderShowOwnedOnly(host, mine, 'Impossible de charger la liste des extensions (api.pokemontcg.io ne répond pas). Voici tes cartes en attendant — réessayer dans un moment.');
+binderShowOwnedOnly(host, mine, 'Impossible de charger la liste des extensions (api.pokemontcg.io ne répond pas). Voici tes cartes en attendant — réessaie dans un moment.');
 const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>renderBinder(el('viewBody'));
 host.prepend(b);
 });

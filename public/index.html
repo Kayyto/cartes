@@ -286,6 +286,28 @@
     .mobile-menu-btn{display:flex !important;}
   }
   .mobile-menu-btn{display:none; margin-right:8px;}
+.binder-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(118px,1fr)); gap:12px; margin-bottom:22px;}
+.binder-tile{cursor:pointer; min-width:0;}
+.bt-img{aspect-ratio:5/7; border-radius:8px; overflow:hidden; background:var(--panel-2); border:1px solid var(--line); position:relative;}
+.bt-img img{width:100%; height:100%; object-fit:cover; display:block;}
+.bt-img .noimg{display:flex; align-items:center; justify-content:center; height:100%; padding:6px; text-align:center; color:var(--ink-dim); font-size:11px;}
+.bt-num{position:absolute; left:5px; top:5px; background:rgba(43,35,32,.75); color:#fff; font-size:10px; padding:1px 6px; border-radius:99px;}
+.bt-qty{position:absolute; right:5px; bottom:5px; background:var(--accent); color:#fff; font-size:11px; font-weight:700; padding:1px 7px; border-radius:99px;}
+.bt-name{font-size:11.5px; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.binder-tile:hover .bt-img{border-color:var(--accent);}
+.binder-tile.missing .bt-img img{filter:grayscale(1); opacity:.32;}
+.binder-tile.missing .bt-name{color:var(--ink-dim);}
+.binder-head{display:flex; align-items:center; gap:16px; margin-bottom:12px;}
+.binder-logo{height:46px; max-width:150px; object-fit:contain;}
+.binder-progress{margin-bottom:18px;}
+.bp-top{font-size:13px; margin-bottom:6px;}
+.bp-bar{height:10px; background:var(--accent-soft); border-radius:99px; overflow:hidden;}
+.bp-bar div{height:100%; background:var(--accent); border-radius:99px;}
+.binder-set-title{font-family:'Archivo',sans-serif; font-size:15px; margin:18px 0 10px;}
+.binder-note{background:var(--panel-2); border:1px solid var(--line); border-radius:10px; padding:10px 14px; font-size:13px; color:var(--ink-dim); margin-bottom:14px;}
+.coll-binder{margin-top:12px; width:100%; padding:7px 10px; border:1px solid var(--line); background:var(--panel-2); border-radius:8px; font-size:12.5px; font-weight:600; cursor:pointer; color:var(--ink);}
+.coll-binder:hover{border-color:var(--accent); color:var(--accent);}
+
 </style>
 </head>
 <body>
@@ -499,6 +521,7 @@ const NAV_ITEMS = [
   {id:'dashboard', label:'Tableau de bord'},
   {id:'catalogue', label:'Catalogue'},
   {id:'collections', label:'Mes séries'},
+{id:'binder', label:'Classeur'},
   {id:'wishlist', label:'Ma wishlist'},
   {id:'settings', label:'Paramètres'},
 ];
@@ -727,6 +750,7 @@ function renderTopbar(){
     dashboard: ['Tableau de bord', greetingSub()],
     catalogue: ['Catalogue', 'Parcours et filtre toutes tes cartes.'],
     collections: ['Mes séries', 'Une série par jeu ou univers de cartes.'],
+binder: ['Classeur', 'Ta collection extension par extension, avec les cartes manquantes en grisé.'],
     wishlist: ['Ma wishlist', 'Les cartes que tu veux ajouter à ta collection.'],
     settings: ['Paramètres', 'Personnalise l\'app et gère ton compte.'],
     detail: ['Détail carte', '']
@@ -771,6 +795,7 @@ function renderViewBody(){
   if(view === 'dashboard') return renderDashboard(body);
   if(view === 'catalogue') return renderCatalogue(body);
   if(view === 'collections') return renderCollections(body);
+if(view === 'binder') return renderBinder(body);
   if(view === 'wishlist') return renderWishlist(body);
   if(view === 'settings') return renderSettings(body);
   if(view === 'detail') return renderDetail(body);
@@ -1021,6 +1046,7 @@ function renderCollections(body){
         <div><b>${fmtPrice(categoryValue(cat))}</b><div>valeur</div></div>
       </div>`;
     d.onclick = ()=>{ catalogueFilters.category = cat; setView('catalogue'); };
+const bb = document.createElement('button'); bb.type = 'button'; bb.className = 'coll-binder'; bb.textContent = '📖 Classeur'; bb.onclick = (e)=>{ e.stopPropagation(); binderState.category = cat; binderState.setId = ''; setView('binder'); }; d.appendChild(bb);
     d.querySelector('.coll-delete').onclick = (e)=>{ e.stopPropagation(); deleteCategory(cat); };
     host.appendChild(d);
   });
@@ -1041,6 +1067,256 @@ function deleteCategory(name){
   recordValueSnapshot();
   saveState();
   renderAll();
+}
+
+/* ================= CLASSEUR ================= */
+const binderState = { category: '', setId: '', filter: 'all', sets: null, cards: null, error: '', loading: false, token: 0 };
+const BINDER_API = 'https://api.pokemontcg.io/v2/';
+function binderLsGet(k, ttl){
+try{ const o = JSON.parse(localStorage.getItem(k) || 'null'); if(o && Date.now() - o.t < ttl) return o.d; }catch(e){}
+return null;
+}
+function binderLsSet(k, d){
+try{ localStorage.setItem(k, JSON.stringify({t: Date.now(), d})); return true; }catch(e){ return false; }
+}
+function binderPref(cat, val){
+try{
+const all = JSON.parse(localStorage.getItem('binder-pref-v1') || '{}');
+if(val === undefined) return all[cat] || '';
+all[cat] = val; localStorage.setItem('binder-pref-v1', JSON.stringify(all));
+}catch(e){}
+return '';
+}
+async function binderFetch(url){
+let lastErr;
+for(let i=0;i<3;i++){
+const ctl = new AbortController();
+const to = setTimeout(()=>ctl.abort(), 30000);
+try{
+const r = await fetch(url, {signal: ctl.signal});
+clearTimeout(to);
+if(r.ok) return await r.json();
+lastErr = new Error('HTTP ' + r.status);
+}catch(e){ clearTimeout(to); lastErr = e; }
+await new Promise(res=>setTimeout(res, 700*(i+1)));
+}
+throw lastErr;
+}
+async function binderFetchAll(path, extra){
+let page = 1, out = [], total = Infinity;
+while(out.length < total && page < 12){
+const j = await binderFetch(`${BINDER_API}${path}?${extra}&pageSize=250&page=${page}`);
+total = j.totalCount || 0;
+out = out.concat(j.data || []);
+if(!(j.data || []).length) break;
+page++;
+}
+return out;
+}
+async function binderLoadSets(){
+if(binderState.sets) return binderState.sets;
+let d = binderLsGet('binder-sets-v1', 7*86400000);
+if(!d){
+d = await binderFetchAll('sets', 'orderBy=-releaseDate&select=id,name,series,printedTotal,total,releaseDate,images');
+binderLsSet('binder-sets-v1', d);
+}
+binderState.sets = d;
+return d;
+}
+async function binderLoadCards(setId){
+const key = 'binder-cards-v1:' + setId;
+let d = binderLsGet(key, 30*86400000);
+if(!d){
+d = await binderFetchAll('cards', `q=set.id:${encodeURIComponent(setId)}&orderBy=number&select=id,name,number,rarity,images`);
+d = d.map(c=>({id:c.id, name:c.name, number:c.number, rarity:c.rarity||'', img:(c.images&&c.images.small)||''}));
+if(binderLsSet(key, d)){
+try{
+const idx = JSON.parse(localStorage.getItem('binder-cards-index') || '[]').filter(x=>x!==setId);
+idx.push(setId);
+while(idx.length > 12){ localStorage.removeItem('binder-cards-v1:' + idx.shift()); }
+localStorage.setItem('binder-cards-index', JSON.stringify(idx));
+}catch(e){}
+}
+}
+return d;
+}
+const bNorm = s => String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]/g,'');
+function bNum(n){
+const s = String(n||'').split('/')[0].trim().toUpperCase();
+const m = s.match(/^([A-Z]*)0*(\d+)([A-Z]*)$/);
+return m ? m[1] + m[2] + m[3] : s;
+}
+function bDenom(n){ const p = String(n||'').split('/'); return p.length > 1 ? parseInt(p[1], 10) || 0 : 0; }
+function bNatCmp(a, b){ return String(a).localeCompare(String(b), 'fr', {numeric:true}); }
+function isPokemonCat(cat){ return /pok[eé]mon/i.test(cat || ''); }
+function binderKnown(sets){ return new Set(sets.map(s=>bNorm(s.name))); }
+function binderCardInSet(c, set, known){
+if(bNorm(c.set) === bNorm(set.name)) return true;
+const pt = Number(set.printedTotal) || 0;
+return !!pt && !known.has(bNorm(c.set)) && bDenom(c.number) === pt;
+}
+function binderOwnedFor(set, cards, known){
+return cards.filter(c=>binderCardInSet(c, set, known));
+}
+function binderTile(o){
+const t = document.createElement('div');
+t.className = 'binder-tile' + (o.owned ? '' : ' missing');
+const img = document.createElement('div'); img.className = 'bt-img';
+if(o.img){ const im = document.createElement('img'); im.loading = 'lazy'; im.alt = ''; im.src = o.img; img.appendChild(im); }
+else { const n = document.createElement('div'); n.className = 'noimg'; n.textContent = o.name || '?'; img.appendChild(n); }
+const num = document.createElement('span'); num.className = 'bt-num'; num.textContent = o.number ? '#' + String(o.number).split('/')[0] : '';
+img.appendChild(num);
+if(o.owned && o.qty > 1){ const q = document.createElement('span'); q.className = 'bt-qty'; q.textContent = '×' + o.qty; img.appendChild(q); }
+t.appendChild(img);
+const nm = document.createElement('div'); nm.className = 'bt-name'; nm.textContent = o.name || '';
+t.appendChild(nm);
+t.onclick = o.onclick || null;
+t.title = (o.owned ? '' : 'Manquante · ') + (o.name || '');
+return t;
+}
+function binderProgress(host, owned, total, extra){
+const pct = total ? Math.round(owned / total * 100) : 0;
+const d = document.createElement('div');
+d.className = 'binder-progress';
+d.innerHTML = `<div class="bp-top"><b>${owned} / ${total}</b> cartes · ${pct} %${extra ? ' · ' + escapeHtml(extra) : ''}</div><div class="bp-bar"><div style="width:${pct}%"></div></div>`;
+host.appendChild(d);
+}
+function binderShowOwnedOnly(host, cards, note){
+host.innerHTML = '';
+if(note){ const n = document.createElement('div'); n.className = 'binder-note'; n.textContent = note; host.appendChild(n); }
+if(!cards.length){ host.insertAdjacentHTML('beforeend', '<div class="chart-empty">Aucune carte dans cette série pour l\'instant.</div>'); return; }
+const bySet = new Map();
+cards.forEach(c=>{ const k = c.set || 'Sans extension'; if(!bySet.has(k)) bySet.set(k, []); bySet.get(k).push(c); });
+[...bySet.keys()].sort(bNatCmp).forEach(k=>{
+const list = bySet.get(k).slice().sort((a,b)=>bNatCmp(bNum(a.number), bNum(b.number)) || bNatCmp(a.name, b.name));
+const h = document.createElement('h3'); h.className = 'binder-set-title'; h.textContent = `${k} · ${list.length} carte${list.length>1?'s':''}`;
+host.appendChild(h);
+const g = document.createElement('div'); g.className = 'binder-grid';
+list.forEach(c=>g.appendChild(binderTile({owned:true, img:c.image, name:c.name, number:c.number, qty:c.quantity||1, onclick:()=>setView('detail', {id:c.id})})));
+host.appendChild(g);
+});
+}
+function renderBinder(body){
+if(!state.categories.length){ body.innerHTML = emptyStateHtml(); wireEmptyState(); return; }
+if(!binderState.category || !state.categories.includes(binderState.category)){
+binderState.category = (state.categories.includes(state.activeCategory) && state.activeCategory) || state.categories.find(isPokemonCat) || state.categories[0];
+}
+const cat = binderState.category;
+body.innerHTML = `
+<div class="filters-row">
+<select id="binderCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===cat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
+<span id="binderSetBox" style="display:contents;"></span>
+</div>
+<div id="binderHost"></div>`;
+el('binderCat').onchange = e=>{ binderState.category = e.target.value; binderState.setId = ''; binderState.cards = null; renderBinder(el('viewBody')); };
+const host = el('binderHost');
+const mine = state.cards.filter(c=>c.category === cat);
+if(!isPokemonCat(cat)){
+binderShowOwnedOnly(host, mine, 'Pour l\'instant, les cartes manquantes en grisé sont disponibles pour les séries Pokémon. Ici, tes cartes sont classées par extension et par numéro.');
+return;
+}
+const token = ++binderState.token;
+host.innerHTML = '<div class="chart-empty">Chargement des extensions Pokémon…</div>';
+binderLoadSets().then(sets=>{
+if(token !== binderState.token) return;
+binderRenderSetPicker(sets, mine, token);
+}).catch(()=>{
+if(token !== binderState.token) return;
+binderShowOwnedOnly(host, mine, 'Impossible de charger la liste des extensions (api.pokemontcg.io ne répond pas). Voici tes cartes en attendant — réessayer dans un moment.');
+const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>renderBinder(el('viewBody'));
+host.prepend(b);
+});
+}
+function binderRenderSetPicker(sets, mine, token){
+const cat = binderState.category;
+const known = binderKnown(sets);
+const cnt = new Map();
+sets.forEach(s=>{ const n = mine.filter(c=>binderCardInSet(c, s, known)).length; if(n) cnt.set(s.id, n); });
+const ownedSets = sets.filter(s=>cnt.has(s.id)).sort((a,b)=>cnt.get(b.id) - cnt.get(a.id));
+let sel = binderState.setId && sets.some(s=>s.id===binderState.setId) ? binderState.setId : '';
+if(!sel){ const p = binderPref(cat); if(p && sets.some(s=>s.id===p)) sel = p; }
+if(!sel && ownedSets.length) sel = ownedSets[0].id;
+if(!sel && sets.length) sel = sets[0].id;
+binderState.setId = sel;
+const series = new Map();
+sets.forEach(s=>{ const k = s.series || 'Autres'; if(!series.has(k)) series.set(k, []); series.get(k).push(s); });
+const opt = s=>`<option value="${escapeHtml(s.id)}" ${s.id===sel?'selected':''}>${escapeHtml(s.name)} (${s.total||s.printedTotal||'?'})</option>`;
+const box = el('binderSetBox');
+box.innerHTML = `
+<select id="binderSet" style="min-width:220px;max-width:100%;">
+${ownedSets.length ? `<optgroup label="Mes extensions">${ownedSets.map(opt).join('')}</optgroup>` : ''}
+${[...series.keys()].map(k=>`<optgroup label="${escapeHtml(k)}">${series.get(k).map(opt).join('')}</optgroup>`).join('')}
+</select>
+<select id="binderFilter">
+<option value="all">Toutes les cartes</option>
+<option value="owned">Possédées</option>
+<option value="missing">Manquantes</option>
+</select>`;
+el('binderFilter').value = binderState.filter;
+el('binderSet').onchange = e=>{ binderState.setId = e.target.value; binderPref(cat, e.target.value); binderRenderSet(sets, mine, ++binderState.token); };
+el('binderFilter').onchange = e=>{ binderState.filter = e.target.value; binderRenderSet(sets, mine, ++binderState.token); };
+binderRenderSet(sets, mine, token);
+}
+function binderRenderSet(sets, mine, token){
+const host = el('binderHost');
+if(!host) return;
+const set = sets.find(s=>s.id === binderState.setId);
+if(!set){ host.innerHTML = ''; return; }
+host.innerHTML = '<div class="chart-empty">Chargement de la liste des cartes…</div>';
+binderLoadCards(set.id).then(api=>{
+if(token !== binderState.token) return;
+const owned = binderOwnedFor(set, mine, binderKnown(sets));
+const byNum = new Map();
+owned.forEach(c=>{ const k = bNum(c.number); if(!byNum.has(k)) byNum.set(k, []); byNum.get(k).push(c); });
+const apiSorted = api.slice().sort((a,b)=>bNatCmp(a.number, b.number));
+const apiKeys = new Set(apiSorted.map(c=>bNum(c.number)));
+let have = 0;
+const rows = apiSorted.map(ac=>{
+const list = byNum.get(bNum(ac.number)) || [];
+if(list.length) have++;
+return {ac, list};
+});
+const unknown = owned.filter(c=>!apiKeys.has(bNum(c.number)));
+host.innerHTML = '';
+const head = document.createElement('div'); head.className = 'binder-head';
+if(set.images && set.images.logo){ const lg = document.createElement('img'); lg.src = set.images.logo; lg.alt = ''; lg.className = 'binder-logo'; head.appendChild(lg); }
+const tt = document.createElement('div');
+tt.innerHTML = `<h2 class="display" style="margin:0 0 4px;font-size:20px;"></h2><div style="color:var(--ink-dim);font-size:12.5px;"></div>`;
+tt.querySelector('h2').textContent = set.name;
+tt.querySelector('div').textContent = `${set.series || ''}${set.releaseDate ? ' · ' + set.releaseDate.replace(/\//g,'-') : ''}`;
+head.appendChild(tt);
+host.appendChild(head);
+const secret = (set.printedTotal && apiSorted.length > set.printedTotal) ? `dont ${apiSorted.length - set.printedTotal} secrètes` : '';
+const copies = owned.length > have ? `${owned.reduce((s,c)=>s+Number(c.quantity||1),0)} exemplaires` : '';
+binderProgress(host, have, apiSorted.length, [secret, copies].filter(Boolean).join(' · '));
+const f = binderState.filter;
+const shown = rows.filter(r=> f === 'all' || (f === 'owned' ? r.list.length : !r.list.length));
+const g = document.createElement('div'); g.className = 'binder-grid';
+if(!shown.length) g.innerHTML = '<div class="chart-empty" style="grid-column:1/-1;">' + (f === 'missing' ? 'Bravo, rien ne manque dans cette extension !' : 'Aucune carte à afficher.') + '</div>';
+shown.forEach(({ac, list})=>{
+const first = list[0];
+g.appendChild(binderTile({
+owned: !!list.length, img: ac.img, name: ac.name, number: ac.number,
+qty: list.reduce((s,c)=>s+Number(c.quantity||1),0),
+onclick: first ? ()=>setView('detail', {id:first.id}) : ()=>showToast(`Il te manque : ${ac.name} (#${bNum(ac.number)})`)
+}));
+});
+host.appendChild(g);
+if(unknown.length){
+const h = document.createElement('h3'); h.className = 'binder-set-title'; h.textContent = `Autres cartes de cette extension (${unknown.length}) — numéro non reconnu`;
+host.appendChild(h);
+const g2 = document.createElement('div'); g2.className = 'binder-grid';
+unknown.forEach(c=>g2.appendChild(binderTile({owned:true, img:c.image, name:c.name, number:c.number, qty:c.quantity||1, onclick:()=>setView('detail', {id:c.id})})));
+host.appendChild(g2);
+}
+}).catch(()=>{
+if(token !== binderState.token) return;
+host.innerHTML = '';
+const n = document.createElement('div'); n.className = 'binder-note'; n.textContent = 'Impossible de charger la liste des cartes de cette extension (api.pokemontcg.io est lent ou indisponible).';
+host.appendChild(n);
+const b = document.createElement('button'); b.className = 'btn ghost sm'; b.textContent = 'Réessayer'; b.onclick = ()=>binderRenderSet(sets, mine, ++binderState.token);
+host.appendChild(b);
+});
 }
 
 /* ================= WISHLIST ================= */

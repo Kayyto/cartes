@@ -14,6 +14,8 @@
 //           secrètes (Gemini, JustTCG, Google) ; réservés aux personnes connectées.
 // Tout le reste est servi depuis /public (fichiers statiques).
 
+import { matchCard } from './match.js';
+
 const COMPTE_URL = 'https://compte.kayto.org';
 const APP_SLUG = 'cartes';
 const SESSION_COOKIE = 'kc_cartes';
@@ -103,6 +105,7 @@ export default {
       if (p === '/api/vision' && req.method === 'POST') return await handleOutil(req, env, url, true);
       if (p === '/api/price' && req.method === 'GET') return await handleOutil(req, env, url, false);
       if (p === '/api/image-search' && req.method === 'GET') return await handleOutil(req, env, url, false);
+      if (p === '/api/match' && req.method === 'GET') return await handleMatch(req, env, url);
       return json({ error: 'not_found' }, 404);
     } catch (err) {
       console.error('Cartes — erreur serveur', err);
@@ -140,6 +143,18 @@ async function handlePutData(req, env) {
     'INSERT INTO collections (account_id, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at'
   ).bind(account.id, dataStr, new Date().toISOString()).run();
   return json({ ok: true });
+}
+
+// Recherche automatique de la carte (nom + numéro + extension) dans la base TCGdex.
+async function handleMatch(req, env, url) {
+  const account = await getAccount(req, env);
+  if (!account) return unauthorized(req);
+  const q = url.searchParams;
+  const result = await matchCard({
+    game: q.get('game') || '', name: q.get('name') || '', number: q.get('number') || '',
+    set: q.get('set') || '', language: q.get('lang') || '',
+  });
+  return json(result);
 }
 
 // Outils externes (IA, prix, images) via l'ancien Worker, uniquement pour les personnes connectées.

@@ -1166,25 +1166,27 @@ const autoState = { running:false, stop:false, done:0, total:0, added:0, merged:
 function mapPokeRarity(raw){
 const s = String(raw||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase();
 if(!s) return 'Commun';
-if(/secret|hyper|rainbow|arc-en-ciel/.test(s)) return 'Mythique';
-if(/special illustration|illustration speciale|ultra|noir et blanc|black white|gold|\bor\b/.test(s)) return 'Légendaire';
-if(/illustration|double|holo|vmax|vstar|\bex\b|\bgx\b|\bv\b|radiant|chromatique|shiny|amazing|prism/.test(s)) return 'Épique';
-if(/rare/.test(s)) return 'Rare';
+if(/secret|hyper|rainbow|arc-en-ciel|mythic|enchanted|starlight|ghost|overnumbered|showcase|\bsec\b/.test(s)) return 'Mythique';
+if(/special illustration|illustration speciale|ultra|noir et blanc|black white|gold|\bor\b|legendary|ultimate|\bsp\b/.test(s)) return 'Légendaire';
+if(/illustration|double|holo|vmax|vstar|\bex\b|\bgx\b|\bv\b|radiant|chromatique|shiny|amazing|prism|super rare|\bsr\b|epic|collector/.test(s)) return 'Épique';
+if(/rare|^l$|leader|^r$/.test(s)) return 'Rare';
 return 'Commun';
 }
 async function matchCardApi(p){
-const qs = new URLSearchParams({ game: p.game||'', name: p.name||'', number: p.number||'', set: p.set||'', lang: p.language||'' });
+let gk = ''; try{ gk = binderGameFor(p.game||''); }catch(e){}
+const qs = new URLSearchParams({ game: p.game||'', gk, name: p.name||'', number: p.number||'', set: p.set||'', lang: p.language||'' });
 const res = await fetch('/api/match?' + qs.toString());
 if(!res.ok) throw new Error('HTTP ' + res.status);
 return await res.json();
 }
-function cardDataFromMatch(c){
-return { name:c.name, set:c.set, number:c.number, language:c.language, price:c.price||0, illustrator:c.illustrator||'', rarity:mapPokeRarity(c.rarity), image:c.image||'' };
+function cardDataFromMatch(c, lang){
+return { name:c.name, set:c.set, number:c.number, language:(c.langExact === false ? (lang || 'Français') : c.language), price:c.price||0, illustrator:c.illustrator||'', rarity:mapPokeRarity(c.rarity), image:c.image||'' };
 }
 
 /* ---- dans la fenêtre d'ajout d'une carte ---- */
 function applyMatchToForm(c){
-el('f_name').value = c.name; el('f_set').value = c.set; el('f_number').value = c.number; el('f_language').value = c.language;
+el('f_name').value = c.name; el('f_set').value = c.set; el('f_number').value = c.number;
+if(c.langExact !== false && [...el('f_language').options].some(o=>o.value===c.language)) el('f_language').value = c.language;
 fillRaritySelect(mapPokeRarity(c.rarity));
 if(c.illustrator) el('f_illustrator').value = c.illustrator;
 if(c.price && !(parseFloat(el('f_price').value) > 0)) el('f_price').value = Number(c.price).toFixed(2);
@@ -1213,7 +1215,7 @@ async function autoMatchForm(){
 const status = el('scanStatus'); status.style.display = 'block'; status.className = 'scan-status';
 const p = { game: currentFormCategory(), name: el('f_name').value.trim(), number: el('f_number').value.trim(), set: el('f_set').value.trim(), language: el('f_language').value };
 if(!p.name && !(p.set && p.number)){ status.textContent = "Renseigne le nom (ou l'extension et le numéro) pour la recherche automatique."; return; }
-status.textContent = 'Recherche de la carte dans la base Pokémon…';
+status.textContent = 'Recherche de la carte dans la base ' + autoGameLabel(p.game) + '…';
 try{
 const r = await matchCardApi(p);
 if(r.status === 'sure'){
@@ -1229,13 +1231,15 @@ status.textContent = 'Aucune correspondance. Vérifie le nom et le numéro, ou r
 }catch(e){ status.textContent = 'Recherche automatique impossible (' + e.message + ').'; }
 }
 (function(){
-const f = el('pokeSearchField');
-if(!f || el('autoMatchBtn')) return;
+const ref = el('pokeSearchField');
+if(!ref || el('autoMatchBtn')) return;
+const f = document.createElement('div'); f.className = 'field'; f.id = 'autoMatchField'; f.style.display = 'none';
 const b = document.createElement('button');
-b.type = 'button'; b.id = 'autoMatchBtn'; b.className = 'btn sm'; b.style.marginTop = '8px';
+b.type = 'button'; b.id = 'autoMatchBtn'; b.className = 'btn sm';
 b.textContent = '✨ Trouver la carte et son image automatiquement';
 b.onclick = autoMatchForm;
 f.appendChild(b);
+ref.parentNode.insertBefore(f, ref);
 })();
 
 /* ---- aides ---- */
@@ -1282,15 +1286,15 @@ catch(e){ autoState.review.push({ thumb, base:{name:'',set:'',number:'',language
 const base = { name: infos.nom || '', set: infos.set || '', number: infos.numero || '', language: 'Français', rarity: mapPokeRarity(infos.rarete) };
 if(!base.name && !(base.set && base.number)){ autoState.review.push({ thumb, base, category, candidates:[], error:'Rien de lisible sur cette photo' }); return; }
 let r = null;
-if(isPokemonCat(category)){ try{ r = await matchCardApi({ game:category, ...base }); }catch(e){} }
+if(isAutoCat(category)){ try{ r = await matchCardApi({ game:category, ...base }); }catch(e){} }
 if(r && r.status === 'sure' && autoAdd){
-const kind = autoAddOrMerge(category, cardDataFromMatch(r.card));
+const kind = autoAddOrMerge(category, cardDataFromMatch(r.card, base.language));
 autoState[kind === 'added' ? 'added' : 'merged']++;
 await autoSaveTick();
 return;
 }
 const cands = r && r.status === 'maybe' ? r.candidates : (r && r.status === 'sure' ? [r.card] : []);
-autoState.review.push({ thumb, base, category, candidates: cands, error: r && r.status === 'none' ? 'Aucune correspondance dans la base' : (!isPokemonCat(category) ? 'Pas de base automatique pour ce jeu (image à ajouter à la main)' : '') });
+autoState.review.push({ thumb, base, category, candidates: cands, error: r && r.status === 'none' ? 'Aucune correspondance dans la base' : (!isAutoCat(category) ? 'Pas de base automatique pour ce jeu (image à ajouter à la main)' : '') });
 }
 async function runAutoScan(files, category, autoAdd){
 if(autoState.running) return;
@@ -1320,7 +1324,7 @@ autoSaveTick(); updateAutoUI();
 
 /* ---- compléter les images des cartes déjà dans l'app ---- */
 function autoFillTargets(replacePhotos){
-return state.cards.filter(c=>isPokemonCat(c.category) && (!c.image || (replacePhotos && isOwnPhoto(c.image))));
+return state.cards.filter(c=>isAutoCat(c.category) && (!c.image || (replacePhotos && isOwnPhoto(c.image))));
 }
 function autoApplyToCard(card, c){
 card.image = c.image || card.image;
@@ -1363,11 +1367,11 @@ updateAutoUI();
 /* ---- page « Scan en lot » ---- */
 function renderAutoScan(body){
 if(!state.categories.length){ body.innerHTML = emptyStateHtml(); wireEmptyState(); return; }
-const pokeCat = state.categories.find(isPokemonCat) || state.categories[0];
+const pokeCat = state.categories.find(isPokemonCat) || state.categories.find(isAutoCat) || state.categories[0];
 body.innerHTML = `
 <div class="panel" style="margin-bottom:16px;">
 <h3>Scanner des photos en lot</h3>
-<p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Choisis plusieurs photos de cartes (une carte par photo). L'IA lit chaque carte, l'app retrouve l'image officielle en français et les ajoute toutes seules quand elle est sûre. Les cas douteux vont dans la liste à vérifier plus bas. Garde cet onglet ouvert pendant le traitement.</p>
+<p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Choisis plusieurs photos de cartes (une carte par photo). L'IA lit chaque carte, l'app retrouve l'image officielle (Pokémon, Magic, Yu-Gi-Oh!, One Piece, Lorcana, Riftbound, Dragon Ball) et les ajoute toutes seules quand elle est sûre. Les cas douteux vont dans la liste à vérifier plus bas. Garde cet onglet ouvert pendant le traitement.</p>
 <div class="filters-row">
 <select id="autoCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===pokeCat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
 <input type="file" id="autoFiles" accept="image/*" multiple>
@@ -1433,7 +1437,7 @@ item.candidates.forEach(c=>{
 const b = document.createElement('div'); b.style.cssText = 'cursor:pointer;width:84px;font-size:10.5px;text-align:center;';
 const im = document.createElement('img'); im.src = c.thumb || c.image; im.style.cssText = 'width:84px;border-radius:5px;border:1px solid var(--line);';
 const tx = document.createElement('div'); tx.textContent = `${c.name} ${c.number}`;
-b.appendChild(im); b.appendChild(tx); b.onclick = ()=>autoReviewAdd(item, cardDataFromMatch(c)); cands.appendChild(b);
+b.appendChild(im); b.appendChild(tx); b.onclick = ()=>autoReviewAdd(item, cardDataFromMatch(c, item.base && item.base.language)); cands.appendChild(b);
 });
 box.appendChild(cands);
 if(item.base.name){ box.appendChild(btn('Ajouter tel quel (sans image)', ()=>autoReviewAdd(item, { name:item.base.name, set:item.base.set, number:item.base.number, language:'Français', rarity:item.base.rarity }), true)); }
@@ -1513,6 +1517,9 @@ return m ? String(parseInt(m[1], 10)) + m[2] : s;
 function bDenom(n){ const p = String(n||'').split('/'); return p.length > 1 ? parseInt(p[1], 10) || 0 : 0; }
 function bNatCmp(a, b){ return String(a).localeCompare(String(b), 'fr', {numeric:true}); }
 function isPokemonCat(cat){ return /pok[eé]mon/i.test(cat || ''); }
+// Catégorie dont le jeu a une base de données (Pokémon, Magic, Yu-Gi-Oh!, One Piece, Lorcana, Riftbound, Dragon Ball)
+function isAutoCat(cat){ try{ return binderGameFor(cat) !== 'manual'; }catch(e){ return isPokemonCat(cat); } }
+function autoGameLabel(cat){ try{ return BINDER_GAMES[binderGameFor(cat)].label; }catch(e){ return 'cartes'; } }
 
 /* ---- bases de données par jeu ---- */
 const TCGDEX_FR = 'https://api.tcgdex.net/v2/fr/';
@@ -2205,6 +2212,7 @@ function openCardModal(cardId, presetFile){
 
   const isPoke = /pok[eé]mon/i.test(category || '');
   el('pokeSearchField').style.display = isPoke ? 'block' : 'none';
+  el('autoMatchField').style.display = isAutoCat(category) ? 'block' : 'none';
   el('f_pokeQuery').value = ''; el('pokeResults').innerHTML = '';
 
   const isJustTcg = /one\s*piece|my\s*little\s*pony/i.test(category || '');
@@ -2414,7 +2422,7 @@ el('aiScanBtn').addEventListener('click', async ()=>{
     if(infos.rarete){
       fillRaritySelect(mapRarityGuess(infos.rarete));
     }
-    if(isPokemonCat(currentFormCategory())) setTimeout(autoMatchForm, 0);
+    if(isAutoCat(currentFormCategory())) setTimeout(autoMatchForm, 0);
     status.textContent = infos.jeu ? `Détecté : ${infos.nom || '?'} (${infos.jeu}). Vérifie avant d'enregistrer.` : "Analyse terminée, vérifie les champs.";
     status.classList.add('ready');
   }catch(err){ status.textContent = "L'analyse a échoué (" + err.message + "). Renseigne la carte manuellement."; }

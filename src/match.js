@@ -4,7 +4,7 @@
 // Riftbound (Riftcodex), Dragon Ball Fusion World (données apitcg sur GitHub).
 
 const TCGDEX = 'https://api.tcgdex.net/v2';
-const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const setsCache = new Map(); // langue -> { at, list }
 const SETS_TTL = 12 * 3600 * 1000;
 
@@ -20,6 +20,7 @@ async function tj(path, f) {
 
 function langsFor(language) {
   const s = norm(language);
+  if (s.startsWith('japon') || s === 'ja' || s === 'jp' || s.startsWith('japan')) return ['ja', 'en'];
   if (s.startsWith('angl') || s === 'en' || s.startsWith('engl')) return ['en', 'fr'];
   return ['fr', 'en'];
 }
@@ -50,7 +51,8 @@ async function setIdByName(lang, setName, f) {
   const k = norm(setName);
   if (!k) return null;
   const list = await setList(lang, f);
-  let s = list.find((x) => norm(x.name) === k);
+  const code = String(setName || '').trim().toLowerCase();
+  let s = list.find((x) => String(x.id).toLowerCase() === code) || list.find((x) => norm(x.name) === k);
   if (!s && k.length >= 5) s = list.find((x) => norm(x.name).includes(k) || k.includes(norm(x.name)));
   return s ? s.id : null;
 }
@@ -106,7 +108,7 @@ function shape(c, imageFallback) {
     image: img ? img + '/high.webp' : '',
     thumb: img ? img + '/low.webp' : '',
     price: Math.round(price * 100) / 100,
-    language: c._lang === 'en' ? 'Anglais' : 'Français',
+    language: LANG_NAMES[c._lang] || 'Français',
   };
 }
 
@@ -115,7 +117,8 @@ async function matchPokemon(p, f) {
   if (!p.name && !(p.set && num.variants.length)) return { status: 'none' };
   const cands = await findCandidates(p, num, f);
   if (!cands.length) return { status: 'none' };
-  const top = cands.slice(0, 8);
+  const lim = Math.min(30, Math.max(0, parseInt(p.limit, 10) || 0));
+  const top = cands.slice(0, lim || 8);
   const fulls = (await Promise.all(top.map((c) => tj(`/${c.lang}/cards/${encodeURIComponent(c.id)}`, f))))
     .map((c, i) => (c ? Object.assign(c, { _lang: top[i].lang }) : null)).filter(Boolean);
   if (!fulls.length) return { status: 'none' };
@@ -142,8 +145,8 @@ async function matchPokemon(p, f) {
     const en = await tj(`/en/cards/${encodeURIComponent(c.id)}`, f);
     return shape(c, en && en.image);
   };
-  if (sure) return { status: 'sure', card: await enrich(best.c) };
-  return { status: 'maybe', candidates: await Promise.all(scored.slice(0, 5).map((x) => enrich(x.c))) };
+  if (sure && !lim) return { status: 'sure', card: await enrich(best.c) };
+  return { status: 'maybe', candidates: await Promise.all(scored.slice(0, lim || 5).map((x) => enrich(x.c))) };
 }
 
 
@@ -462,6 +465,7 @@ export async function matchCard(p, f = fetch) {
     number: String(p.number || '').slice(0, 20),
     set: String(p.set || '').slice(0, 80),
     language: String(p.language || '').slice(0, 20),
+    limit: String(p.limit || '').slice(0, 3),
   };
   if (p.gk === 'manual') return { status: 'unsupported' };
   let key = MATCHERS[String(p.gk || '')] ? String(p.gk) : '';

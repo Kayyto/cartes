@@ -1192,7 +1192,7 @@ return 'Commun';
 }
 async function matchCardApi(p){
 let gk = ''; try{ gk = binderGameFor(p.game||''); }catch(e){}
-const qs = new URLSearchParams({ game: p.game||'', gk, name: p.name||'', number: p.number||'', set: p.set||'', lang: p.language||'' });
+const qs = new URLSearchParams({ game: p.game||'', gk, name: p.name||'', number: p.number||'', set: p.set||'', lang: p.language||'', limit: p.limit||'' });
 const res = await fetch('/api/match?' + qs.toString());
 if(!res.ok) throw new Error('HTTP ' + res.status);
 return await res.json();
@@ -1229,6 +1229,27 @@ row.onclick = ()=>onPick(c);
 host.appendChild(row);
 });
 }
+function autoPickLanguage(infos){
+  const sel = document.getElementById('autoLang');
+  const v = sel && sel.value;
+  if (v) return v;
+  const txt = String((infos && infos.nom) || '') + String((infos && infos.set) || '');
+  return /[\u3040-\u30ff\u3400-\u9fff]/.test(txt) ? 'Japonais' : 'Français';
+}
+async function autoFreeSearch(){
+  const q = el('autoFreeQuery').value.trim();
+  const status = el('scanStatus'); status.style.display = 'block'; status.className = 'scan-status';
+  if (!q) { el('autoFreeQuery').focus(); return; }
+  const p = { game: currentFormCategory(), name: q, number: el('f_number').value.trim(), set: el('f_set').value.trim(), language: el('f_language').value, limit: 24 };
+  status.textContent = 'Recherche de « ' + q + ' » dans la base ' + autoGameLabel(p.game) + '…';
+  try {
+    const r = await matchCardApi(p);
+    const list = r.status === 'sure' ? [r.card] : (r.candidates || []);
+    if (!list.length) { el('pokeResults').innerHTML = ''; status.textContent = 'Aucune carte trouvée pour « ' + q + ' ». Essaie un autre nom, ou renseigne aussi le numéro / l’extension.'; return; }
+    renderMatchCandidates(list, el('pokeResults'), c => { applyMatchToForm(c); el('pokeResults').innerHTML = ''; status.textContent = 'Carte choisie : ' + c.name + ' · ' + c.set + ' ' + c.number + '. Vérifie puis enregistre.'; status.classList.add('ready'); });
+    status.textContent = list.length + ' résultat(s) : clique sur la bonne carte.';
+  } catch (e) { status.textContent = 'Recherche impossible pour le moment, réessaie.'; }
+}
 async function autoMatchForm(){
 const status = el('scanStatus'); status.style.display = 'block'; status.className = 'scan-status';
 const p = { game: currentFormCategory(), name: el('f_name').value.trim(), number: el('f_number').value.trim(), set: el('f_set').value.trim(), language: el('f_language').value };
@@ -1257,6 +1278,14 @@ b.type = 'button'; b.id = 'autoMatchBtn'; b.className = 'btn sm';
 b.textContent = '✨ Trouver la carte et son image automatiquement';
 b.onclick = autoMatchForm;
 f.appendChild(b);
+const mrow = document.createElement('div');
+mrow.style.cssText = 'display:flex;gap:6px;margin-top:8px;flex-wrap:wrap';
+const mi = document.createElement('input');
+mi.type = 'text'; mi.id = 'autoFreeQuery'; mi.placeholder = 'Recherche libre : nom en japonais ou en anglais'; mi.style.cssText = 'flex:1;min-width:180px';
+mi.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); autoFreeSearch(); } });
+const mb = document.createElement('button');
+mb.type = 'button'; mb.className = 'btn ghost sm'; mb.textContent = '🔍 Chercher'; mb.onclick = () => autoFreeSearch();
+mrow.appendChild(mi); mrow.appendChild(mb); f.appendChild(mrow);
 ref.parentNode.insertBefore(f, ref);
 })();
 
@@ -1301,7 +1330,7 @@ try{ thumb = await resizeImageFile(file, 160); }catch(e){}
 let infos;
 try{ infos = await autoVision(file); }
 catch(e){ autoState.review.push({ thumb, base:{name:'',set:'',number:'',language:'Français'}, category, candidates:[], error:'Lecture par l\'IA impossible (' + e.message + ')' }); return; }
-const base = { name: infos.nom || '', set: infos.set || '', number: infos.numero || '', language: 'Français', rarity: mapPokeRarity(infos.rarete) };
+const base = { name: infos.nom || '', set: infos.set || '', number: infos.numero || '', language: autoPickLanguage(infos), rarity: mapPokeRarity(infos.rarete) };
 if(!base.name && !(base.set && base.number)){ autoState.review.push({ thumb, base, category, candidates:[], error:'Rien de lisible sur cette photo' }); return; }
 let r = null;
 if(isAutoCat(category)){ try{ r = await matchCardApi({ game:category, ...base }); }catch(e){} }
@@ -1392,7 +1421,7 @@ body.innerHTML = `
 <p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Choisis plusieurs photos de cartes (une carte par photo). L'IA lit chaque carte, l'app retrouve l'image officielle (Pokémon, Magic, Yu-Gi-Oh!, One Piece, Lorcana, Riftbound, Dragon Ball) et les ajoute toutes seules quand elle est sûre. Les cas douteux vont dans la liste à vérifier plus bas. Garde cet onglet ouvert pendant le traitement.</p>
 <div class="filters-row">
 <select id="autoCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===pokeCat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
-<input type="file" id="autoFiles" accept="image/*" multiple><button type="button" class="btn ghost sm" id="autoCam">📷 Appareil photo</button><span class="scan-status" id="autoCamCount"></span>
+<select id="autoLang" title="Langue des cartes"><option value="">Langue : auto</option><option>Français</option><option>Anglais</option><option>Japonais</option></select><input type="file" id="autoFiles" accept="image/*" multiple><button type="button" class="btn ghost sm" id="autoCam">📷 Appareil photo</button><span class="scan-status" id="autoCamCount"></span>
 <label style="font-size:13px;display:flex;gap:6px;align-items:center;"><input type="checkbox" id="autoAdd" checked> Ajouter automatiquement les cartes sûres</label>
 </div>
 <div class="filters-row"><button class="btn" id="autoStart">Lancer le scan</button><button class="btn ghost" id="autoStop" style="display:none;">Arrêter</button></div>

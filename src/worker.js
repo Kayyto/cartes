@@ -335,7 +335,7 @@ async function handleMatch(req, env, url) {
   const q = url.searchParams;
   const result = await matchCard({
     game: q.get('game') || '', name: q.get('name') || '', number: q.get('number') || '',
-    set: q.get('set') || '', language: q.get('lang') || '',
+    set: q.get('set') || '', language: q.get('lang') || '', gk: q.get('gk') || '',
   });
   return json(result);
 }

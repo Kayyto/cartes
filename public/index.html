@@ -389,7 +389,7 @@
       <div class="row2">
         <div class="field">
           <label>Série</label>
-          <input type="text" id="f_category_display" disabled>
+          <select id="f_category_display"></select>
         </div>
         <div class="field">
           <label>Langue</label>
@@ -877,6 +877,11 @@ binder: ['Classeur', 'Ta collection extension par extension, avec les cartes man
         openCardModal(null, batchQueue[0]);
       };
       actions.appendChild(camBtn);
+      const moveBtn = document.createElement('button');
+      moveBtn.className = 'btn ghost';
+      moveBtn.textContent = '☑️ Déplacer des cartes';
+      moveBtn.onclick = () => startMoveMode();
+      actions.appendChild(moveBtn);
     }
     const addCatBtn = document.createElement('button');
     addCatBtn.className = 'btn ghost';
@@ -2210,7 +2215,26 @@ function fillRaritySelect(selected){
   if(!selected) sel.value = 'Commun';
 }
 
+let lastFormCategory = '';
+function fillCategorySelect(cur){
+  const sel = el('f_category_display');
+  const list = state.categories.slice();
+  if (cur && !list.includes(cur)) list.push(cur);
+  sel.innerHTML = list.map(c => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('');
+  sel.value = cur || (list[0] || '');
+}
+function refreshCategoryDependents(){
+  const category = currentFormCategory();
+  el('pokeSearchField').style.display = /pok[eé]mon/i.test(category || '') ? 'block' : 'none';
+  el('autoMatchField').style.display = isAutoCat(category) ? 'block' : 'none';
+  el('justtcgSearchField').style.display = /one\s*piece|my\s*little\s*pony/i.test(category || '') ? 'block' : 'none';
+}
 function currentFormCategory(){
+  const sel = el('f_category_display');
+  if (sel && sel.tagName === 'SELECT' && sel.value && el('cardOverlay').classList.contains('open')) return sel.value;
+  return currentFormCategoryDefault();
+}
+function currentFormCategoryDefault(){
   return editingCardId ? state.cards.find(c=>c.id===editingCardId).category : (catalogueFilters.category || state.activeCategory || state.categories[0]);
 }
 
@@ -2227,8 +2251,9 @@ function openCardModal(cardId, presetFile){
   el('err_name').style.display = 'none';
   el('skipBatchBtn').style.display = (presetFile && batchQueue.length) ? 'inline-block' : 'none';
 
-  const category = currentFormCategory();
-  el('f_category_display').value = category || '';
+  const keepCat = (!cardId && presetFile && batchIndex > 0 && lastFormCategory && state.categories.includes(lastFormCategory)) ? lastFormCategory : '';
+  const category = keepCat || currentFormCategoryDefault();
+  fillCategorySelect(category);
 
   const isPoke = /pok[eé]mon/i.test(category || '');
   el('pokeSearchField').style.display = isPoke ? 'block' : 'none';
@@ -2437,6 +2462,74 @@ el('camSingleBtn').onclick = async () => {
   const tab = document.querySelector('.imgtab[data-mode="file"]'); if (tab) tab.click();
   camSetFiles(el('f_imageFile'), files, false);
 };
+
+el('f_category_display').addEventListener('change', () => { lastFormCategory = el('f_category_display').value; refreshCategoryDependents(); });
+
+/* ---- Déplacer des cartes d'une série à une autre (sélection multiple) ---- */
+let moveMode = false;
+const moveSel = new Set();
+(function injectMoveStyles(){
+  const st = document.createElement('style');
+  st.textContent = '.card-tile.sel{outline:3px solid var(--accent,#e0443e);outline-offset:-3px}.card-tile .sel-check{position:absolute;top:8px;left:8px;width:26px;height:26px;border-radius:50%;background:rgba(0,0,0,.55);border:2px solid #fff;color:#fff;display:flex;align-items:center;justify-content:center;font-size:15px;z-index:5;pointer-events:none}.card-tile.sel .sel-check{background:var(--accent,#e0443e)}#moveBar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:8000;background:var(--panel,#fff);color:var(--ink,#222);border:1px solid var(--line,#ccc);border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.3);padding:10px 14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;max-width:calc(100vw - 20px)}#moveBar select{max-width:200px}';
+  document.head.appendChild(st);
+})();
+const _cardTileEl = cardTileEl;
+cardTileEl = function(card){
+  const tile = _cardTileEl(card);
+  tile.style.position = tile.style.position || 'relative';
+  if (!moveMode) return tile;
+  const chk = document.createElement('div');
+  chk.className = 'sel-check';
+  chk.textContent = moveSel.has(card.id) ? '✓' : '';
+  tile.appendChild(chk);
+  tile.classList.toggle('sel', moveSel.has(card.id));
+  tile.addEventListener('click', e => {
+    if (!moveMode) return;
+    e.preventDefault(); e.stopImmediatePropagation();
+    if (moveSel.has(card.id)) moveSel.delete(card.id); else moveSel.add(card.id);
+    tile.classList.toggle('sel', moveSel.has(card.id));
+    chk.textContent = moveSel.has(card.id) ? '✓' : '';
+    updateMoveBar();
+  }, true);
+  return tile;
+};
+function updateMoveBar(){
+  const n = el('moveCount'); if (n) n.textContent = moveSel.size + ' carte(s) sélectionnée(s)';
+  const b = el('moveGo'); if (b) b.disabled = !moveSel.size;
+}
+function stopMoveMode(){
+  moveMode = false; moveSel.clear();
+  const bar = document.getElementById('moveBar'); if (bar) bar.remove();
+  renderAll();
+}
+function startMoveMode(){
+  if (!state.categories.length) { showToast('Crée d\'abord une série.'); return; }
+  moveMode = true; moveSel.clear();
+  let bar = document.getElementById('moveBar'); if (bar) bar.remove();
+  bar = document.createElement('div');
+  bar.id = 'moveBar';
+  bar.innerHTML = '<b id="moveCount">0 carte(s) sélectionnée(s)</b>' +
+    '<button type="button" class="btn ghost sm" id="moveAll">Tout sélectionner</button>' +
+    '<span>Déplacer vers</span><select id="moveTarget">' + state.categories.map(c => '<option value="' + escapeHtml(c) + '">' + escapeHtml(c) + '</option>').join('') + '</select>' +
+    '<button type="button" class="btn sm" id="moveGo" disabled>Déplacer</button>' +
+    '<button type="button" class="btn ghost sm" id="moveCancel">Terminer</button>';
+  document.body.appendChild(bar);
+  el('moveAll').onclick = () => { const list = filteredCards(); const all = list.length && list.every(c => moveSel.has(c.id)); list.forEach(c => { if (all) moveSel.delete(c.id); else moveSel.add(c.id); }); renderAll(); updateMoveBar(); };
+  el('moveCancel').onclick = stopMoveMode;
+  el('moveGo').onclick = () => {
+    const target = el('moveTarget').value;
+    const cards = state.cards.filter(c => moveSel.has(c.id));
+    if (!cards.length || !target) return;
+    cards.forEach(c => { c.category = target; });
+    logActivity(cards.length + ' carte(s) déplacée(s) vers ' + target);
+    saveState();
+    showToast(cards.length + ' carte(s) déplacée(s) vers « ' + target + ' ».');
+    moveSel.clear();
+    renderAll(); updateMoveBar();
+  };
+  setView('catalogue');
+  renderAll(); updateMoveBar();
+}
 
 function resizeImageFile(file, maxDim){
   maxDim = maxDim || 420;

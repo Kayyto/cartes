@@ -370,6 +370,7 @@
         </div>
         <input type="text" id="f_imageUrl" placeholder="https://...">
         <input type="file" id="f_imageFile" accept="image/*" capture="environment" style="display:none;">
+        <button type="button" class="btn ghost sm" id="camSingleBtn" style="margin:6px 0">📷 Ouvrir l'appareil photo</button>
         <div class="imgpreview" id="imgPreview" style="display:none;"><img id="imgPreviewImg"></div>
         <button type="button" class="btn ghost sm" id="scanBtn" style="display:none; margin-top:8px; margin-right:8px;">Lire le texte de la photo</button>
         <button type="button" class="btn ghost sm" id="aiScanBtn" style="display:none; margin-top:8px;">Analyser avec l'IA</button>
@@ -864,6 +865,18 @@ binder: ['Classeur', 'Ta collection extension par extension, avec les cartes man
       batchBtn.textContent = '+ Scanner plusieurs cartes';
       batchBtn.onclick = ()=>el('batchFileInput').click();
       actions.appendChild(batchBtn);
+      const camBtn = document.createElement('button');
+      camBtn.className = 'btn ghost';
+      camBtn.textContent = '📷 Scanner avec l\'appareil photo';
+      camBtn.onclick = async () => {
+        const files = await openCameraCapture({ multi: true });
+        if (files === null) { camUnavailable(); return; }
+        if (!files.length) return;
+        if (!state.categories.length) { showToast('Crée d\'abord une série.'); return; }
+        batchQueue = files; batchIndex = 0;
+        openCardModal(null, batchQueue[0]);
+      };
+      actions.appendChild(camBtn);
     }
     const addCatBtn = document.createElement('button');
     addCatBtn.className = 'btn ghost';
@@ -1374,7 +1387,7 @@ body.innerHTML = `
 <p style="font-size:13px;color:var(--ink-dim);margin:0 0 12px;">Choisis plusieurs photos de cartes (une carte par photo). L'IA lit chaque carte, l'app retrouve l'image officielle (Pokémon, Magic, Yu-Gi-Oh!, One Piece, Lorcana, Riftbound, Dragon Ball) et les ajoute toutes seules quand elle est sûre. Les cas douteux vont dans la liste à vérifier plus bas. Garde cet onglet ouvert pendant le traitement.</p>
 <div class="filters-row">
 <select id="autoCat">${state.categories.map(c=>`<option value="${escapeHtml(c)}" ${c===pokeCat?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select>
-<input type="file" id="autoFiles" accept="image/*" multiple>
+<input type="file" id="autoFiles" accept="image/*" multiple><button type="button" class="btn ghost sm" id="autoCam">📷 Appareil photo</button><span class="scan-status" id="autoCamCount"></span>
 <label style="font-size:13px;display:flex;gap:6px;align-items:center;"><input type="checkbox" id="autoAdd" checked> Ajouter automatiquement les cartes sûres</label>
 </div>
 <div class="filters-row"><button class="btn" id="autoStart">Lancer le scan</button><button class="btn ghost" id="autoStop" style="display:none;">Arrêter</button></div>
@@ -1395,6 +1408,13 @@ if(!files.length){ showToast('Choisis d\'abord des photos.'); return; }
 runAutoScan(files, el('autoCat').value, el('autoAdd').checked);
 };
 el('autoStop').onclick = ()=>{ autoState.stop = true; };
+el('autoCam').onclick = async () => {
+  const files = await openCameraCapture({ multi: true });
+  if (files === null) { camUnavailable(); return; }
+  if (!files.length) return;
+  camSetFiles(el('autoFiles'), files, true);
+};
+el('autoFiles').addEventListener('change', () => { const n = el('autoFiles').files.length; el('autoCamCount').textContent = n ? ' ' + n + ' photo(s) prête(s)' : ''; });
 el('fillStart').onclick = ()=>runAutoFill(el('fillReplace').checked);
 el('fillStop').onclick = ()=>{ autoState.fill.stop = true; };
 el('fillReplace').onchange = updateAutoUI;
@@ -2301,6 +2321,122 @@ document.querySelectorAll('.imgtab').forEach(tab=>{
     el('f_imageFile').style.display = imgMode==='file' ? 'block' : 'none';
   };
 });
+
+/* ====== Appareil photo intégré (viseur) pour scanner des cartes ====== */
+(function injectCamStyles(){
+  if (document.getElementById('cam-style')) return;
+  const st = document.createElement('style');
+  st.id = 'cam-style';
+  st.textContent = `
+#cam-overlay{position:fixed;inset:0;z-index:9000;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center}
+#cam-overlay video{width:100%;flex:1;min-height:0;object-fit:contain;background:#000}
+#cam-overlay .cam-bar{width:100%;display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;padding:12px;background:rgba(0,0,0,.85)}
+#cam-overlay .cam-shot{width:68px;height:68px;border-radius:50%;border:4px solid #fff;background:#e8e8e8;cursor:pointer;flex:none}
+#cam-overlay .cam-shot:active{background:#bbb}
+#cam-overlay .cam-info{color:#fff;font-size:14px;text-align:center;width:100%}
+#cam-overlay .cam-msg{position:absolute;top:14px;left:12px;right:12px;text-align:center;color:#fff;background:rgba(0,0,0,.6);border-radius:10px;padding:8px;font-size:14px}
+#cam-overlay .cam-flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .25s}
+#cam-overlay .cam-guide{position:absolute;top:8%;bottom:22%;left:50%;aspect-ratio:63/88;transform:translateX(-50%);border:2px dashed rgba(255,255,255,.55);border-radius:12px;pointer-events:none}
+`;
+  document.head.appendChild(st);
+})();
+
+// Ouvre le viseur. multi:true => on enchaîne plusieurs photos puis « Terminer ».
+// Retourne une promesse : liste de File (vide si annulé), ou null si la caméra est indisponible.
+function openCameraCapture(opts){
+  opts = opts || {};
+  const multi = !!opts.multi;
+  return new Promise(resolve => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { resolve(null); return; }
+    const shots = [];
+    let stream = null, devices = [], devIdx = -1, closed = false;
+    const ov = document.createElement('div');
+    ov.id = 'cam-overlay';
+    ov.innerHTML = `<video playsinline muted autoplay></video><div class="cam-guide"></div><div class="cam-flash"></div><div class="cam-msg" style="display:none"></div>
+      <div class="cam-bar">
+        <div class="cam-info">${multi ? 'Cadre une carte, appuie sur le rond blanc, recommence pour la suivante.' : 'Cadre la carte puis appuie sur le rond blanc.'}</div>
+        <button type="button" class="btn ghost" id="cam-cancel">Annuler</button>
+        <button type="button" class="cam-shot" id="cam-shot" aria-label="Prendre la photo"></button>
+        <button type="button" class="btn ghost" id="cam-switch" style="display:none">🔄 Caméra</button>
+        ${multi ? '<button type="button" class="btn" id="cam-done" disabled>Terminer (0)</button>' : ''}
+      </div>`;
+    document.body.appendChild(ov);
+    const video = ov.querySelector('video');
+    const msg = ov.querySelector('.cam-msg');
+    const finish = (val) => {
+      if (closed) return;
+      closed = true;
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) { /* rien */ }
+      document.removeEventListener('keydown', onKey);
+      ov.remove();
+      resolve(val);
+    };
+    const onKey = e => { if (e.key === 'Escape') finish(shots.length && multi ? shots : []); };
+    document.addEventListener('keydown', onKey);
+    const start = async (deviceId) => {
+      try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) { /* rien */ }
+      const video_c = deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } } : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: video_c, audio: false });
+      } catch (err) {
+        if (!closed) finish(null);
+        return;
+      }
+      if (closed) { stream.getTracks().forEach(t => t.stop()); return; }
+      video.srcObject = stream;
+      try { await video.play(); } catch (e) { /* autoplay */ }
+      try {
+        devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+        const cur = stream.getVideoTracks()[0] && stream.getVideoTracks()[0].getSettings().deviceId;
+        devIdx = Math.max(0, devices.findIndex(d => d.deviceId === cur));
+        ov.querySelector('#cam-switch').style.display = devices.length > 1 ? '' : 'none';
+      } catch (e) { /* rien */ }
+    };
+    ov.querySelector('#cam-cancel').onclick = () => finish([]);
+    ov.querySelector('#cam-switch').onclick = () => { if (devices.length > 1) { devIdx = (devIdx + 1) % devices.length; start(devices[devIdx].deviceId); } };
+    const done = ov.querySelector('#cam-done');
+    if (done) done.onclick = () => finish(shots);
+    ov.querySelector('#cam-shot').onclick = () => {
+      if (!video.videoWidth) return;
+      const c = document.createElement('canvas');
+      const maxSide = 2000;
+      const k = Math.min(1, maxSide / Math.max(video.videoWidth, video.videoHeight));
+      c.width = Math.round(video.videoWidth * k); c.height = Math.round(video.videoHeight * k);
+      c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+      c.toBlob(blob => {
+        if (!blob) return;
+        const f = new File([blob], 'carte-' + Date.now() + '-' + (shots.length + 1) + '.jpg', { type: 'image/jpeg' });
+        const fl = ov.querySelector('.cam-flash'); fl.style.opacity = '.8'; setTimeout(() => { fl.style.opacity = '0'; }, 120);
+        if (!multi) { finish([f]); return; }
+        shots.push(f);
+        if (done) { done.disabled = false; done.textContent = 'Terminer (' + shots.length + ')'; }
+        msg.style.display = 'block'; msg.textContent = '✓ Photo ' + shots.length + ' prise';
+        setTimeout(() => { msg.style.display = 'none'; }, 1100);
+      }, 'image/jpeg', 0.92);
+    };
+    start(null);
+  });
+}
+
+// Remplace/complète les fichiers d'un <input type=file> à partir de File[] (sans toucher au reste de l'app).
+function camSetFiles(input, files, append){
+  const dt = new DataTransfer();
+  if (append) Array.from(input.files || []).forEach(f => dt.items.add(f));
+  files.forEach(f => dt.items.add(f));
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+function camUnavailable(){
+  showToast('Appareil photo indisponible (autorisation refusée ou navigateur non compatible). Utilise « importer » à la place.');
+}
+
+el('camSingleBtn').onclick = async () => {
+  const files = await openCameraCapture({ multi: false });
+  if (files === null) { camUnavailable(); return; }
+  if (!files.length) return;
+  const tab = document.querySelector('.imgtab[data-mode="file"]'); if (tab) tab.click();
+  camSetFiles(el('f_imageFile'), files, false);
+};
 
 function resizeImageFile(file, maxDim){
   maxDim = maxDim || 420;
